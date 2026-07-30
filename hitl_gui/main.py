@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import argparse
 
-from nicegui import ui
+from nicegui import app, ui
 
 from hitl_gui.gui_controller import GuiController
 
@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     controller = GuiController()
+    app.on_shutdown(controller.shutdown)
     ui.page("/")(controller.build_page)
     ui.run(host=args.host, port=args.port, reload=False, title="LLM Robot HITL Interface")
 

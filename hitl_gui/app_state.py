@@ -130,3 +130,4 @@ class AppState:
     event_log: list[ExecutionEvent] = field(default_factory=list)
     modification_history: list[ExecutionEvent] = field(default_factory=list)
     rviz_running: bool = False
+    rviz_process_status: str = "STOPPED"

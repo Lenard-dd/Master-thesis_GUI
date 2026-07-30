@@ -3,3 +3,6 @@ port: 8080
 reload: false
 mode: "SIMULATION"
 ros_status: "MOCK"
+rviz:
+  executable: "rviz2"
+  config_path: "/home/lenard/dev_ws/src/ur_src/ur5_launcher/config/moveit.rviz"

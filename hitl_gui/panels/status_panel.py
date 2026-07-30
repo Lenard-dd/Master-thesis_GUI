@@ -12,6 +12,7 @@ def create_status_panel(controller):
                     with ui.card().classes("w-full p-2"):
                         with ui.row().classes("w-full items-center justify-between"):
                             ui.label(name).classes("font-medium")
-                            ui.badge(status.value, color="negative" if status.value == "DISCONNECTED" else "primary")
+                            value = state.rviz_process_status if name == "RViz2" else status.value
+                            ui.badge(value, color="negative" if value in {"DISCONNECTED", "ERROR"} else "primary")
     content()
     return content

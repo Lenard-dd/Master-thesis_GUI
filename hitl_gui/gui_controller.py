@@ -12,6 +12,7 @@ from hitl_gui.app_state import (
 )
 from hitl_gui.mock.mock_task_runner import MockTaskRunner
 from hitl_gui.session_logger import SessionLogger
+from hitl_gui.rviz_process_manager import RvizProcessManager, load_rviz_settings
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -53,6 +54,11 @@ class GuiController:
         })
         self.runner = MockTaskRunner(self, step_delay=step_delay)
         self.session_logger = SessionLogger(log_root)
+        rviz_settings = load_rviz_settings()
+        self.rviz_manager = RvizProcessManager(
+            rviz_settings.get("config_path", ""),
+            executable=rviz_settings.get("executable", "rviz2"),
+        )
         self.append_event("gui_initialized", metadata={"message": "GUI initialized"})
 
     def build_page(self) -> None:
@@ -71,7 +77,12 @@ class GuiController:
                             renderers.append(create_status_panel(self))
             renderers.append(create_hitl_panel(self))
             renderers.append(create_log_panel(self))
-        ui.timer(0.25, lambda: [renderer.refresh() for renderer in renderers])
+        ui.timer(0.25, lambda: self._refresh_ui(renderers))
+
+    def _refresh_ui(self, renderers) -> None:
+        self.refresh_rviz_status()
+        for renderer in renderers:
+            renderer.refresh()
 
     def start_task(self, task_name: str) -> str | None:
         task_name = task_name.strip()
@@ -293,6 +304,41 @@ class GuiController:
 
     def export_task_log(self):
         return self.session_logger.export_task(self.state)
+
+    def start_rviz(self) -> dict:
+        result = self.rviz_manager.start_rviz()
+        self._record_rviz_result("rviz_start_requested", result)
+        return result
+
+    def stop_rviz(self) -> dict:
+        result = self.rviz_manager.stop_rviz()
+        self._record_rviz_result("rviz_stop_requested", result)
+        return result
+
+    def restart_rviz(self) -> dict:
+        result = self.rviz_manager.restart_rviz()
+        self._record_rviz_result("rviz_restart_requested", result)
+        return result
+
+    def refresh_rviz_status(self) -> dict:
+        result = self.rviz_manager.get_process_status()
+        self.state.rviz_process_status = result["status"]
+        self.state.rviz_running = result["running"]
+        self.state.hardware_status["RViz2"] = (
+            SystemComponentStatus.RUNNING if result["running"] else SystemComponentStatus.DISCONNECTED
+        )
+        return result
+
+    def request_trajectory_preview(self) -> None:
+        self.append_event("trajectory_preview_requested", node_id="trajectory_review",
+                          metadata={"trajectory_id": self.state.current_trajectory_id, "mode": "mock"})
+
+    def shutdown(self) -> None:
+        self.stop_rviz()
+
+    def _record_rviz_result(self, event_type: str, result: dict) -> None:
+        self.refresh_rviz_status()
+        self.append_event(event_type, metadata=result)
 
     def is_current_task(self, task_id: str) -> bool:
         return self.state.current_task_id == task_id and self.state.task_status not in {TaskStatus.CANCELLED, TaskStatus.IDLE}
