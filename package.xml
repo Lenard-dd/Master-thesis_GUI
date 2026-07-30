@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>hitl_gui</name>
+  <version>0.1.0</version>
+  <description>Static NiceGUI prototype for robot human-in-the-loop review.</description>
+  <maintainer email="your.email@example.com">LLM Robot Project</maintainer>
+  <license>MIT</license>
+  <exec_depend>ament_index_python</exec_depend>
+  <exec_depend>rclpy</exec_depend>
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
