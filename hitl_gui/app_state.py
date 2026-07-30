@@ -46,6 +46,7 @@ class SystemComponentStatus(str, Enum):
     RUNNING = "RUNNING"
     WARNING = "WARNING"
     ERROR = "ERROR"
+    UNKNOWN = "UNKNOWN"
 
 
 class HitlDecision(str, Enum):
@@ -131,3 +132,8 @@ class AppState:
     modification_history: list[ExecutionEvent] = field(default_factory=list)
     rviz_running: bool = False
     rviz_process_status: str = "STOPPED"
+    ros_executor_running: bool = False
+    ros_node_initialized: bool = False
+    ros_monitor_data: dict[str, Any] = field(default_factory=dict)
+    component_processes: dict[str, Any] = field(default_factory=dict)
+    simulation_launch_status: str = "IDLE"

@@ -3,6 +3,58 @@ port: 8080
 reload: false
 mode: "SIMULATION"
 ros_status: "MOCK"
+gui_mode: "MOCK"  # MOCK keeps the demo independent; set ROS to start monitoring.
+ros_monitor:
+  refresh_hz: 5
+  ready_age_sec: 1.0
+  warning_age_sec: 3.0
+  joint_state_topic: "/joint_states"
+  rgb_topic: "/camera/camera/color/image_raw"
+  depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+  gripper_state_topic: "/gripper_state"
+  move_group_node: "move_group"
+  planning_scene_service: "/get_planning_scene"
 rviz:
   executable: "rviz2"
   config_path: "/home/lenard/dev_ws/src/ur_src/ur5_launcher/config/moveit.rviz"
+system_launcher:
+  ros_domain_id: 27
+  workspace_path: "/home/lenard/dev_ws"
+  components:
+    camera:
+      type: ros2_launch
+      display_name: "D435i Camera"
+      package: realsense2_camera
+      launch_file: rs_launch.py
+      arguments: ["enable_rgbd:=true", "enable_sync:=true", "align_depth.enable:=true", "enable_color:=true", "enable_depth:=true", "pointcloud.enable:=true"]
+      timeout_sec: 15
+    ur5_fake:
+      type: ros2_launch
+      display_name: "UR5 Fake Hardware"
+      package: ur5_launcher
+      launch_file: ur5_complete.launch.py
+      arguments: ["robot_ip:=192.168.10.27", "use_fake_hardware:=true", "activate_joint_controller:=true", "start_camera_node:=false", "use_nominal_camera_extrinsics:=true", "launch_rviz:=false"]
+      timeout_sec: 20
+    ur5_real:
+      type: ros2_launch
+      display_name: "UR5 Real Hardware"
+      package: ur5_launcher
+      launch_file: ur5_complete.launch.py
+      arguments: ["robot_ip:=192.168.10.27", "use_fake_hardware:=false", "activate_joint_controller:=true", "start_camera_node:=false", "use_nominal_camera_extrinsics:=true", "launch_rviz:=false"]
+      requires_confirmation: true
+      timeout_sec: 20
+    gripper:
+      type: ros2_launch
+      display_name: "Robotiq Gripper"
+      package: robotiq_gripper_communication
+      launch_file: ros_gripper_comm.launch.py
+      arguments: []
+      timeout_sec: 10
+    graspgenx:
+      type: external_process
+      display_name: "GraspGenX Server"
+      conda_environment: graspgenx
+      working_directory: "/home/lenard/GraspGenX/GraspGenX"
+      executable: python
+      arguments: ["client-server/graspgenx_server.py", "--config", "/home/lenard/GraspGenX/GraspGenX/ext/graspgenx_checkpoints/release", "--assets_dir", "/home/lenard/GraspGenX/GraspGenX/assets", "--default_gripper", "robotiq_2f_140", "--port", "5556"]
+      timeout_sec: 15

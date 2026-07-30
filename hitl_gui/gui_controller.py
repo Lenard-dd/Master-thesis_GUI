@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -12,7 +13,10 @@ from hitl_gui.app_state import (
 )
 from hitl_gui.mock.mock_task_runner import MockTaskRunner
 from hitl_gui.session_logger import SessionLogger
-from hitl_gui.rviz_process_manager import RvizProcessManager, load_rviz_settings
+from hitl_gui.rviz_process_manager import RvizProcessManager, load_gui_config
+from hitl_gui.ros_worker import RosWorker
+from hitl_gui.message_converter import component_status
+from hitl_gui.component_process_manager import ComponentProcessManager
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -20,6 +24,7 @@ from hitl_gui.panels.hitl_panel import create_hitl_panel
 from hitl_gui.panels.log_panel import create_log_panel
 from hitl_gui.panels.status_panel import create_status_panel
 from hitl_gui.panels.tool_flow_panel import create_tool_flow_panel
+from hitl_gui.panels.component_log_panel import create_component_log_panel
 
 
 FLOW = [
@@ -54,11 +59,15 @@ class GuiController:
         })
         self.runner = MockTaskRunner(self, step_delay=step_delay)
         self.session_logger = SessionLogger(log_root)
-        rviz_settings = load_rviz_settings()
+        self.gui_config = load_gui_config()
+        rviz_settings = self.gui_config.get("rviz", {})
         self.rviz_manager = RvizProcessManager(
             rviz_settings.get("config_path", ""),
             executable=rviz_settings.get("executable", "rviz2"),
         )
+        self.ros_worker: RosWorker | None = None
+        self.component_manager = ComponentProcessManager(self.gui_config.get("system_launcher", {}))
+        self.set_gui_mode(self.gui_config.get("gui_mode", "MOCK"))
         self.append_event("gui_initialized", metadata={"message": "GUI initialized"})
 
     def build_page(self) -> None:
@@ -77,10 +86,14 @@ class GuiController:
                             renderers.append(create_status_panel(self))
             renderers.append(create_hitl_panel(self))
             renderers.append(create_log_panel(self))
-        ui.timer(0.25, lambda: self._refresh_ui(renderers))
+            renderers.append(create_component_log_panel(self))
+        refresh_hz = self.gui_config.get("ros_monitor", {}).get("refresh_hz", 5)
+        ui.timer(1.0 / max(1, refresh_hz), lambda: self._refresh_ui(renderers))
 
     def _refresh_ui(self, renderers) -> None:
         self.refresh_rviz_status()
+        self.refresh_component_processes()
+        self.consume_ros_status()
         for renderer in renderers:
             renderer.refresh()
 
@@ -335,6 +348,110 @@ class GuiController:
 
     def shutdown(self) -> None:
         self.stop_rviz()
+        if self.ros_worker:
+            self.ros_worker.shutdown()
+        self.component_manager.shutdown()
+
+    def refresh_component_processes(self) -> None:
+        self.state.component_processes = self.component_manager.refresh()
+
+    def start_component(self, component_id: str, *, confirmed: bool = False):
+        self.append_event("component_start_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
+        managed = self.component_manager.start_component(component_id, confirmed=confirmed)
+        event = "component_started" if managed.status.value == "RUNNING" else "component_start_failed"
+        self.append_event(event, metadata={"component_id": component_id, "command_summary": managed.command, "pid": managed.pid, "robot_mode": component_id, "initiated_by": "gui"})
+        self.refresh_component_processes()
+        return managed
+
+    def stop_component(self, component_id: str):
+        self.append_event("component_stop_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
+        managed = self.component_manager.stop_component(component_id)
+        if managed:
+            self.append_event("component_stopped", metadata={"component_id": component_id, "pid": managed.pid, "exit_code": managed.exit_code, "initiated_by": "gui"})
+        self.refresh_component_processes()
+        return managed
+
+    def restart_component(self, component_id: str, *, confirmed: bool = False):
+        self.append_event("component_restart_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
+        managed = self.component_manager.restart_component(component_id, confirmed=confirmed)
+        self.refresh_component_processes()
+        return managed
+
+    def confirm_real_ur5_start(self):
+        self.append_event("real_robot_driver_confirmed", metadata={"component_id": "ur5_real", "robot_ip": "192.168.10.27", "initiated_by": "gui"})
+        return self.start_component("ur5_real", confirmed=True)
+
+    def start_simulation_components(self):
+        """Launch only the configured simulation stack, with ROS-health gating."""
+        if self.state.simulation_launch_status == "RUNNING":
+            return None
+        self.state.simulation_launch_status = "RUNNING"
+        return asyncio.create_task(self._start_simulation_components())
+
+    async def _start_simulation_components(self):
+        ur5 = self.start_component("ur5_fake")
+        if ur5.status.value != "RUNNING":
+            self.state.simulation_launch_status = "FAILED: UR5 Fake process"
+            return
+        timeout = self.gui_config["system_launcher"]["components"]["ur5_fake"].get("timeout_sec", 20)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            self.consume_ros_status()
+            if self.state.hardware_status["UR5"] == SystemComponentStatus.READY:
+                break
+            await asyncio.sleep(0.2)
+        else:
+            self.state.simulation_launch_status = "FAILED: UR5 ROS Health not READY"
+            self.append_event("component_start_failed", metadata={"component_id": "ur5_fake", "reason": "ROS health timeout"})
+            return
+
+        rviz = self.start_rviz()
+        if rviz["status"] != "RUNNING":
+            self.state.simulation_launch_status = "FAILED: RViz"
+            return
+        for component_id in ("camera", "gripper", "graspgenx"):
+            managed = self.start_component(component_id)
+            if managed.status.value != "RUNNING":
+                self.state.simulation_launch_status = f"FAILED: {component_id}"
+                return
+        self.state.simulation_launch_status = "COMPLETED"
+
+    def stop_gui_managed_components(self):
+        for component_id in list(self.component_manager.processes):
+            self.stop_component(component_id)
+
+    def set_gui_mode(self, mode: str) -> None:
+        mode = mode.upper()
+        self.state.robot_mode = mode
+        if mode == "ROS":
+            self.ros_worker = RosWorker(self.gui_config.get("ros_monitor", {}))
+            self.ros_worker.start()
+            self.state.ros_status = SystemComponentStatus.IDLE
+        else:
+            if self.ros_worker:
+                self.ros_worker.shutdown()
+            self.ros_worker = None
+            self.state.ros_status = SystemComponentStatus.IDLE
+
+    def consume_ros_status(self) -> None:
+        if self.ros_worker is None:
+            self.state.ros_executor_running = False
+            self.state.ros_node_initialized = False
+            return
+        snapshot = self.ros_worker.snapshot()
+        self.state.ros_executor_running = snapshot["executor_running"]
+        self.state.ros_node_initialized = snapshot["node_initialized"]
+        if snapshot.get("worker_error"):
+            self.state.ros_status = SystemComponentStatus.ERROR
+        elif snapshot["executor_running"] and snapshot["node_initialized"]:
+            self.state.ros_status = SystemComponentStatus.RUNNING
+        else:
+            self.state.ros_status = SystemComponentStatus.IDLE
+        monitor = self.gui_config.get("ros_monitor", {})
+        details = component_status(snapshot, monitor.get("ready_age_sec", 1.0), monitor.get("warning_age_sec", 3.0))
+        self.state.ros_monitor_data = details
+        for component in ("UR5", "D435i", "Robotiq 2F-140", "MoveIt", "SAM3", "GraspGenX"):
+            self.state.hardware_status[component] = details[component]["status"]
 
     def _record_rviz_result(self, event_type: str, result: dict) -> None:
         self.refresh_rviz_status()

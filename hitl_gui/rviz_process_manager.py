@@ -9,15 +9,18 @@ from typing import Callable
 import yaml
 
 
-def load_rviz_settings() -> dict:
-    """Load RViz settings from gui_config.yaml for source and installed runs."""
+def load_gui_config() -> dict:
+    """Load gui_config.yaml for source and installed runs."""
     try:
         from ament_index_python.packages import get_package_share_directory
         config_file = Path(get_package_share_directory("hitl_gui")) / "config" / "gui_config.yaml"
     except Exception:
         config_file = Path(__file__).resolve().parents[1] / "config" / "gui_config.yaml"
-    config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
-    return config.get("rviz", {})
+    return yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+
+
+def load_rviz_settings() -> dict:
+    return load_gui_config().get("rviz", {})
 
 
 class RvizProcessManager:
