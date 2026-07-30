@@ -11,6 +11,7 @@ from hitl_gui.app_state import (
     SystemComponentStatus, TaskStatus, ToolNode, ToolStatus, utc_now,
 )
 from hitl_gui.mock.mock_task_runner import MockTaskRunner
+from hitl_gui.session_logger import SessionLogger
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -39,7 +40,7 @@ TASK_STATUS_BY_TOOL = {
 class GuiController:
     """Coordinates state changes while remaining entirely mock-only."""
 
-    def __init__(self, step_delay: float = 0.6) -> None:
+    def __init__(self, step_delay: float = 0.6, log_root: str = "logs") -> None:
         self.state = AppState(hardware_status={
             "ROS 2": SystemComponentStatus.IDLE,
             "UR5": SystemComponentStatus.DISCONNECTED,
@@ -51,7 +52,8 @@ class GuiController:
             "RViz2": SystemComponentStatus.DISCONNECTED,
         })
         self.runner = MockTaskRunner(self, step_delay=step_delay)
-        self.append_event("GUI_INITIALIZED", metadata={"message": "GUI initialized"})
+        self.session_logger = SessionLogger(log_root)
+        self.append_event("gui_initialized", metadata={"message": "GUI initialized"})
 
     def build_page(self) -> None:
         ui.colors(primary="#1d4f91", secondary="#546e7a", accent="#1976d2")
@@ -76,25 +78,27 @@ class GuiController:
         if not task_name or self.state.task_status not in {TaskStatus.IDLE, TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
             return None
         self.reset_task(clear_conversation=False)
+        self.state.event_log.clear()
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         self.state.current_task_id = task_id
         self.state.current_task_name = task_name
         self.state.task_status = TaskStatus.UNDERSTANDING_TASK
         self.state.agent_status = SystemComponentStatus.RUNNING
+        self.append_event("task_created", new_value=task_name)
         self.add_chat_message(task_name, sent=True, name="Operator")
         self.add_chat_message("Agent has received the task. Starting mock workflow.", sent=False, name="Agent")
         self.initialize_tool_tree()
-        self.append_event("TASK_STARTED", new_value=task_name)
+        self.append_event("task_started", new_value=task_name)
         self.runner.start(task_id)
         return task_id
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
-        self.append_event("CHAT_MESSAGE", metadata={"sender": name})
+        self.append_event("chat_message_added", metadata={"sender": name})
 
     def clear_conversation(self) -> None:
         self.state.conversation.clear()
-        self.append_event("CHAT_CLEARED")
+        self.append_event("chat_cleared")
 
     def initialize_tool_tree(self) -> None:
         self.state.tool_nodes = [
@@ -106,7 +110,7 @@ class GuiController:
             )
             for name in FLOW
         ]
-        self.append_event("TOOL_TREE_INITIALIZED")
+        self.append_event("tool_tree_initialized")
 
     def update_tool_status(self, node_id: str, status: ToolStatus, **output: Any) -> bool:
         node = self._node(node_id)
@@ -114,14 +118,34 @@ class GuiController:
             return False
         old_status = node.status
         node.status = status
-        if status == ToolStatus.RUNNING:
+        if status in {ToolStatus.RUNNING, ToolStatus.WAITING_APPROVAL}:
             node.start_time = utc_now()
+            node.input_summary.update(output.pop("input_summary", {}))
         if status in {ToolStatus.SUCCEEDED, ToolStatus.FAILED, ToolStatus.REJECTED, ToolStatus.CANCELLED, ToolStatus.INVALIDATED}:
             node.end_time = utc_now()
             node.duration_ms = self._duration_ms(node.start_time, node.end_time)
+        output_summary = output.pop("output_summary", {})
+        input_summary = output.pop("input_summary", {})
+        error_message = output.pop("error_message", None)
+        if input_summary:
+            node.input_summary.update(input_summary)
+        if output_summary:
+            node.output_summary.update(output_summary)
+        if error_message:
+            node.error_message = error_message
         if output:
             node.output_data.update(output)
-        self.append_event("TOOL_STATUS_CHANGED", node_id=node_id, old_value=old_status.value, new_value=status.value)
+        event_type = {
+            ToolStatus.RUNNING: "tool_started",
+            ToolStatus.SUCCEEDED: "tool_succeeded",
+            ToolStatus.FAILED: "tool_failed",
+        }.get(status, "tool_status_changed")
+        self.append_event(
+            event_type, node_id=node_id, old_value=old_status.value, new_value=status.value,
+            metadata={"status": status.value, "duration_ms": node.duration_ms,
+                      "input_summary": node.input_summary, "output_summary": node.output_summary,
+                      "error_message": node.error_message},
+        )
         return True
 
     def create_trajectory(self) -> str:
@@ -130,7 +154,7 @@ class GuiController:
         node = self._node("plan_motion")
         if node:
             node.output_data["trajectory_id"] = trajectory_id
-        self.append_event("TRAJECTORY_CREATED", node_id="plan_motion", new_value=trajectory_id)
+        self.append_event("trajectory_created", node_id="plan_motion", new_value=trajectory_id)
         return trajectory_id
 
     def create_hitl_request(self) -> HitlRequest:
@@ -143,7 +167,8 @@ class GuiController:
             grasp_candidate_id=None,
         )
         self.state.pending_hitl_request = request
-        self.append_event("HITL_REQUEST_CREATED", node_id="trajectory_review", new_value=request.request_id)
+        self.append_event("hitl_requested", node_id="trajectory_review", new_value=request.request_id,
+                          metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id})
         return request
 
     def submit_hitl_decision(self, request_id: str, decision: HitlDecision) -> bool:
@@ -155,7 +180,19 @@ class GuiController:
         if request.trajectory_id != self.state.current_trajectory_id:
             return False
         request.status = decision.value
-        self.append_event("HITL_DECISION", node_id="trajectory_review", new_value=decision.value)
+        review = self._active_trajectory_review()
+        if review:
+            review.output_summary.update({
+                "decision": decision.value,
+                "approval_latency_ms": self._duration_ms(review.start_time, utc_now()),
+            })
+        event_type = {
+            HitlDecision.APPROVE: "hitl_approved", HitlDecision.REJECT: "hitl_rejected",
+            HitlDecision.REPLAN: "hitl_replan_requested", HitlDecision.CANCEL: "task_cancelled",
+        }[decision]
+        self.append_event(event_type, node_id="trajectory_review", new_value=decision.value,
+                          metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id,
+                                    "user_decision": decision.value})
         if decision == HitlDecision.CANCEL:
             self.cancel_task()
             return True
@@ -173,7 +210,7 @@ class GuiController:
             if node.status in {ToolStatus.PENDING, ToolStatus.RUNNING, ToolStatus.WAITING_APPROVAL}:
                 self.update_tool_status(node.node_id, ToolStatus.CANCELLED)
         self.add_chat_message("Task cancelled by user.", sent=False, name="Agent")
-        self.append_event("TASK_CANCELLED")
+        self.append_event("task_cancelled")
         self.runner.cancel()
 
     def reject_task(self) -> None:
@@ -186,13 +223,18 @@ class GuiController:
         self.state.task_status = TaskStatus.CANCELLED
         self.state.agent_status = SystemComponentStatus.IDLE
         self.add_chat_message("Task was rejected by the user.", sent=False, name="Agent")
-        self.append_event("TASK_REJECTED")
+        self.append_event("task_cancelled", metadata={"reason": "hitl_rejected"})
 
     def replan_task(self) -> None:
         old_review = self._active_trajectory_review()
         if old_review:
             self.update_tool_status(old_review.node_id, ToolStatus.INVALIDATED)
+            self.append_event("trajectory_invalidated", node_id=old_review.node_id,
+                              metadata={"trajectory_id": self.state.current_trajectory_id})
+        old_version = self.state.current_plan_version
         self.state.current_plan_version += 1
+        self.append_event("plan_version_changed", old_value=old_version,
+                          new_value=self.state.current_plan_version)
         attempt = self.state.current_plan_version
         plan_id = f"plan_motion_attempt_{attempt}"
         review_id = f"trajectory_review_attempt_{attempt}"
@@ -209,13 +251,13 @@ class GuiController:
         self.update_tool_status(review_id, ToolStatus.WAITING_APPROVAL)
         self.set_task_status(TaskStatus.WAITING_APPROVAL)
         self.create_hitl_request()
-        self.append_event("PLAN_REPLANNED", node_id=plan_id, new_value=trajectory_id, metadata={"plan_version": attempt})
+        self.append_event("plan_replanned", node_id=plan_id, new_value=trajectory_id, metadata={"plan_version": attempt})
 
     def complete_task(self) -> None:
         self.state.task_status = TaskStatus.COMPLETED
         self.state.agent_status = SystemComponentStatus.IDLE
         self.add_chat_message("Task completed successfully in mock simulation.", sent=False, name="Agent")
-        self.append_event("TASK_COMPLETED")
+        self.append_event("task_completed")
 
     def complete_active_trajectory_review(self) -> None:
         review = self._active_trajectory_review()
@@ -225,12 +267,12 @@ class GuiController:
     def set_task_status(self, status: TaskStatus) -> None:
         old_status = self.state.task_status
         self.state.task_status = status
-        self.append_event("TASK_STATUS_CHANGED", old_value=old_status.value, new_value=status.value)
+        self.append_event("task_status_changed", old_value=old_status.value, new_value=status.value)
 
     def append_event(self, event_type: str, *, node_id: str | None = None, old_value: Any = None, new_value: Any = None, metadata: dict[str, Any] | None = None) -> ExecutionEvent:
-        event = ExecutionEvent(f"event-{uuid.uuid4().hex[:8]}", self.state.current_task_id, node_id, event_type, utc_now(), old_value, new_value, metadata or {})
+        event = ExecutionEvent(f"event-{uuid.uuid4().hex[:8]}", self.state.current_task_id, node_id, event_type, utc_now(), self.state.current_plan_version, old_value, new_value, metadata or {})
         self.state.event_log.append(event)
-        if event_type in {"HITL_DECISION", "PLAN_REPLANNED"}:
+        if event_type in {"hitl_approved", "hitl_rejected", "hitl_replan_requested", "plan_version_changed"}:
             self.state.modification_history.append(event)
         return event
 
@@ -247,7 +289,10 @@ class GuiController:
         self.state.modification_history.clear()
         if clear_conversation:
             self.state.conversation.clear()
-        self.append_event("TASK_RESET")
+        self.append_event("task_reset")
+
+    def export_task_log(self):
+        return self.session_logger.export_task(self.state)
 
     def is_current_task(self, task_id: str) -> bool:
         return self.state.current_task_id == task_id and self.state.task_status not in {TaskStatus.CANCELLED, TaskStatus.IDLE}

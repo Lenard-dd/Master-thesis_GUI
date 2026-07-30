@@ -9,7 +9,7 @@ from typing import Any
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
 class TaskStatus(str, Enum):
@@ -81,6 +81,8 @@ class ToolNode:
     editable_fields: list[str] = field(default_factory=list)
     plan_version: int = 1
     modified_by_user: bool = False
+    input_summary: dict[str, Any] = field(default_factory=dict)
+    output_summary: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -105,6 +107,7 @@ class ExecutionEvent:
     node_id: str | None
     event_type: str
     timestamp: str
+    plan_version: int
     old_value: Any = None
     new_value: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)

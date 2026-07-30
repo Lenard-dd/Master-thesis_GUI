@@ -7,6 +7,15 @@ import asyncio
 from hitl_gui.app_state import HitlDecision, TaskStatus, ToolStatus
 
 
+MOCK_OUTPUTS = {
+    "detect_objects": {"detected_count": 3, "target_candidates": ["red_cube", "blue_cube", "green_cylinder"]},
+    "generate_grasp_candidates": {"candidate_count": 8, "best_score": 0.94},
+    "plan_motion": {"planning_time_ms": 420, "trajectory_points": 42, "trajectory_duration": 3.2, "collision_free": True},
+    "execute_motion": {"execution_duration_ms": 3200, "execution_success": True},
+    "verify_grasp": {"grasp_verified": True},
+}
+
+
 class MockTaskRunner:
     """Simulates reviewed workflow steps without ROS, LLM, or robot access."""
 
@@ -47,9 +56,15 @@ class MockTaskRunner:
                 if not self.controller.is_current_task(task_id):
                     return
                 self.controller.set_task_status(task_status)
-                self.controller.update_tool_status(tool_name, ToolStatus.RUNNING)
+                self.controller.update_tool_status(
+                    tool_name, ToolStatus.RUNNING,
+                    input_summary={"task": self.controller.state.current_task_name},
+                )
                 await asyncio.sleep(self.step_delay)
-                self.controller.update_tool_status(tool_name, ToolStatus.SUCCEEDED)
+                self.controller.update_tool_status(
+                    tool_name, ToolStatus.SUCCEEDED,
+                    output_summary=MOCK_OUTPUTS.get(tool_name, {"success": True}),
+                )
 
             self.controller.create_trajectory()
             self.controller.update_tool_status("trajectory_review", ToolStatus.WAITING_APPROVAL)
@@ -80,6 +95,9 @@ class MockTaskRunner:
             await self._resolve_decision(task_id, self._decision)
 
     async def _simulate_step(self, tool_name: str) -> None:
-        self.controller.update_tool_status(tool_name, ToolStatus.RUNNING)
+        self.controller.update_tool_status(tool_name, ToolStatus.RUNNING, input_summary={"mode": "mock"})
         await asyncio.sleep(self.step_delay)
-        self.controller.update_tool_status(tool_name, ToolStatus.SUCCEEDED)
+        self.controller.update_tool_status(
+            tool_name, ToolStatus.SUCCEEDED,
+            output_summary=MOCK_OUTPUTS.get(tool_name, {"success": True}),
+        )
