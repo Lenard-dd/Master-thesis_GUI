@@ -9,6 +9,16 @@ agent_bridge:
   mode: "existing_openai"  # existing_scripted, existing_openai, or mock
   timeout_sec: 15
   execution_mode: "plan_only"
+runtime_backends:
+  # "mock" is deterministic and intended for short demonstrations.
+  # Set perception_mode to "ros" only after D435i/SAM3 ROS health is READY;
+  # set grasp_mode to "graspgenx" only after the GUI-managed server is running.
+  # A requested live backend never falls back to fabricated mock observations.
+  perception_mode: "mock"  # mock | ros
+  grasp_mode: "mock"       # mock | graspgenx
+  mock_perception:
+    object_id: "mock_red_cube_1"
+    confidence: 0.99
 ros_monitor:
   refresh_hz: 5
   ready_age_sec: 1.0

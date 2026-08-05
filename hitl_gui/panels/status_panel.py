@@ -24,6 +24,7 @@ def create_status_panel(controller):
                     ui.label(f"UR5 Process: {ur5_process.status.value if ur5_process else 'STOPPED'}")
                     ui.label(f"UR5 ROS Health: {state.hardware_status['UR5'].value}")
                     ui.label(f"RViz Process: {state.rviz_process_status}")
+                ui.label(f"Runtime backends: {controller.runtime_adapters.mode_summary}").classes("text-grey")
                 ui.label(f"Simulation launcher: {state.simulation_launch_status}").classes("text-grey")
                 with ui.grid(columns=1).classes("w-full gap-2"):
                     for name, status in [(controller.agent_name, state.agent_status), *state.hardware_status.items()]:

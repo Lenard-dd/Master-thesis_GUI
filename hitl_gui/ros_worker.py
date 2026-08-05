@@ -38,6 +38,15 @@ class RosWorker:
         data.update({"executor_running": self.executor_running, "node_initialized": self.node_initialized, "worker_error": self.error})
         return data
 
+    @property
+    def node(self):
+        """ROS monitor node, exposed read-only for existing runtime adapters.
+
+        Callers must treat it as a shared ROS resource and never spin it.
+        The worker remains the only owner of the executor lifecycle.
+        """
+        return self._node
+
     def _run(self) -> None:
         try:
             import rclpy

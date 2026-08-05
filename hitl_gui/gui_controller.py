@@ -22,6 +22,8 @@ from hitl_gui.message_converter import component_status
 from hitl_gui.component_process_manager import ComponentProcessManager
 from hitl_gui.agent_bridge import ExistingAgentBridge
 from hitl_gui.trajectory_review_adapter import ExistingTrajectoryReviewAdapter
+from hitl_gui.runtime_adapters import RuntimeAdapterRegistry, RuntimeBackendConfig
+from hitl_gui.gui_skill_runtime import GuiSkillRuntimeAdapter
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -66,6 +68,7 @@ class GuiController:
         self._invalidated_trajectory_ids: set[str] = set()
         self._last_trajectory_task = None
         self._last_execution_task = None
+        self._last_skill_task = None
         self.state = AppState(hardware_status={
             "ROS 2": SystemComponentStatus.IDLE,
             "UR5": SystemComponentStatus.DISCONNECTED,
@@ -88,6 +91,9 @@ class GuiController:
         )
         self.ros_worker: RosWorker | None = None
         self.component_manager = ComponentProcessManager(self.gui_config.get("system_launcher", {}))
+        self.runtime_backend_config = RuntimeBackendConfig.from_gui_config(self.gui_config)
+        self.runtime_adapters = RuntimeAdapterRegistry(self.runtime_backend_config)
+        self.skill_runtime = GuiSkillRuntimeAdapter(self, self.runtime_adapters)
         self.set_gui_mode(self.gui_config.get("gui_mode", "MOCK"))
         self.append_event("gui_initialized", metadata={"message": "GUI initialized"})
 
@@ -607,6 +613,30 @@ class GuiController:
                 target = node.input_data.get("target_name") or node.input_data.get("target")
                 if target:
                     self.request_named_target_trajectory(str(target), source_node_id=node.node_id)
+            elif node and node.tool_name in {"safe_pick_object", "safe_pick"} and request.request_type == "task_intent":
+                # This runs only sensor/grasp proposal stages.  It does not
+                # invoke MoveIt or any gripper/robot command.
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    # This branch is for synchronous integration callers. The
+                    # browser callback always owns an event loop and starts
+                    # the runtime immediately.
+                    self.add_chat_message(
+                        "Task intent was approved. Start this workflow from the GUI event loop to run its perception stages.",
+                        sent=False, name="System",
+                    )
+                else:
+                    self._last_skill_task = loop.create_task(
+                        self.skill_runtime.run_safe_pick_observation(node)
+                    )
+            elif node and node.tool_name == "review_grasp_candidate" and request.request_type == "grasp_candidate":
+                node.status = ToolStatus.SUCCEEDED
+                self.state.task_status = TaskStatus.APPROVED_PENDING_EXECUTION
+                self.add_chat_message(
+                    "Grasp candidate approval was recorded. Motion planning will use the existing MoveIt trajectory-review path and is not started automatically.",
+                    sent=False, name="System",
+                )
         else:
             if node:
                 node.status = ToolStatus.REJECTED if decision == HitlDecision.REJECT else ToolStatus.CANCELLED
@@ -627,6 +657,7 @@ class GuiController:
             return {}
 
     def cancel_task(self) -> None:
+        self.skill_runtime.cancel(self.state.current_task_id)
         if self.state.agent_request_running:
             self.state.agent_request_cancelled = True
             self.state.agent_request_running = False
@@ -871,6 +902,10 @@ class GuiController:
             self.state.ros_node_initialized = False
             return
         snapshot = self.ros_worker.snapshot()
+        # Adapter construction is lazy, so this only makes the existing
+        # monitor node available; it neither starts a second executor nor
+        # changes its callback ownership.
+        self.runtime_adapters.ros_node = getattr(self.ros_worker, "node", None)
         self.state.ros_executor_running = snapshot["executor_running"]
         self.state.ros_node_initialized = snapshot["node_initialized"]
         if snapshot.get("worker_error"):
