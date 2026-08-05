@@ -137,3 +137,5 @@ class AppState:
     ros_monitor_data: dict[str, Any] = field(default_factory=dict)
     component_processes: dict[str, Any] = field(default_factory=dict)
     simulation_launch_status: str = "IDLE"
+    agent_request_running: bool = False
+    agent_request_cancelled: bool = False

@@ -77,6 +77,9 @@ def create_log_panel(controller):
                     {"name": "duration", "label": "Duration", "field": "duration", "align": "left"},
                     {"name": "plan_version", "label": "Plan Version", "field": "plan_version", "align": "left"},
                 ], rows=rows, row_key="event_id", selection="single", on_select=select_row,
+                # Pagination prevents the audit table from growing with the
+                # event history while retaining row selection and details.
+                pagination=8,
             ).classes("w-full")
 
     filter_select.on_value_change(lambda _: content.refresh())

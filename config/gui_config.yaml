@@ -4,6 +4,10 @@ reload: false
 mode: "SIMULATION"
 ros_status: "MOCK"
 gui_mode: "MOCK"  # MOCK keeps the demo independent; set ROS to start monitoring.
+agent_bridge:
+  mode: "mock"  # existing_scripted, existing_openai, or mock
+  timeout_sec: 15
+  execution_mode: "plan_only"
 ros_monitor:
   refresh_hz: 5
   ready_age_sec: 1.0

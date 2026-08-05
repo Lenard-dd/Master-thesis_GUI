@@ -17,6 +17,7 @@ from hitl_gui.rviz_process_manager import RvizProcessManager, load_gui_config
 from hitl_gui.ros_worker import RosWorker
 from hitl_gui.message_converter import component_status
 from hitl_gui.component_process_manager import ComponentProcessManager
+from hitl_gui.agent_bridge import ExistingAgentBridge
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -98,6 +99,8 @@ class GuiController:
             renderer.refresh()
 
     def start_task(self, task_name: str) -> str | None:
+        if self.gui_config.get("agent_bridge", {}).get("mode", "mock") != "mock":
+            return self._start_agent_task(task_name)
         task_name = task_name.strip()
         if not task_name or self.state.task_status not in {TaskStatus.IDLE, TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
             return None
@@ -115,6 +118,72 @@ class GuiController:
         self.append_event("task_started", new_value=task_name)
         self.runner.start(task_id)
         return task_id
+
+    def _start_agent_task(self, task_name: str) -> str | None:
+        task_name = task_name.strip()
+        if not task_name or self.state.agent_request_running:
+            return None
+        self.reset_task(clear_conversation=False)
+        self.state.event_log.clear()
+        task_id = f"task-{uuid.uuid4().hex[:8]}"
+        self.state.current_task_id = task_id
+        self.state.current_task_name = task_name
+        self.state.agent_status = SystemComponentStatus.RUNNING
+        self.state.agent_request_running = True
+        self.state.agent_request_cancelled = False
+        self.add_chat_message(task_name, sent=True, name="Operator")
+        self.append_event("agent_task_submitted", new_value=task_name,
+                          metadata={"task_id": task_id, "instruction": task_name,
+                                    "execution_mode": self.gui_config["agent_bridge"].get("execution_mode", "plan_only"),
+                                    "source": "nicegui"})
+        asyncio.create_task(self._request_agent(task_id, task_name))
+        return task_id
+
+    async def _request_agent(self, task_id: str, instruction: str) -> None:
+        config = self.gui_config["agent_bridge"]
+        try:
+            response = await asyncio.wait_for(
+                asyncio.to_thread(
+                    ExistingAgentBridge(config["mode"]).submit, instruction,
+                    config.get("execution_mode", "plan_only"),
+                ),
+                timeout=config.get("timeout_sec", 15),
+            )
+            if self.state.agent_request_cancelled or self.state.current_task_id != task_id:
+                return
+            self.add_chat_message(response.message, sent=False, name="Agent")
+            for event in response.tool_events:
+                self.add_agent_tool_event(event)
+        except asyncio.TimeoutError:
+            self.add_chat_message("Agent request timed out.", sent=False, name="System")
+            self.append_event("agent_error", metadata={"reason": "timeout"})
+        except Exception as exc:
+            self.add_chat_message(str(exc), sent=False, name="System")
+            self.append_event("agent_error", metadata={"reason": str(exc)})
+        finally:
+            self.state.agent_request_running = False
+            self.state.agent_status = SystemComponentStatus.IDLE
+
+    def add_agent_tool_event(self, event) -> None:
+        status_map = {
+            "pending": ToolStatus.PENDING, "running": ToolStatus.RUNNING,
+            "succeeded": ToolStatus.SUCCEEDED, "failed": ToolStatus.FAILED,
+            "waiting_approval": ToolStatus.WAITING_APPROVAL, "rejected": ToolStatus.REJECTED,
+            "cancelled": ToolStatus.CANCELLED,
+        }
+        node = ToolNode(
+            node_id=event.node_id, parent_id=event.parent_id, tool_name=event.tool_name,
+            display_name=event.display_name, status=status_map[event.status],
+            input_data=event.input_json, output_data=event.output_json,
+            input_summary=event.input_json, output_summary=event.output_json,
+            error_message=event.error_message, requires_approval=event.requires_approval,
+            plan_version=self.state.current_plan_version,
+        )
+        self.state.tool_nodes.append(node)
+        self.append_event("agent_tool_event", node_id=node.node_id, new_value=node.status.value,
+                          metadata={"tool_name": node.tool_name, "parent_id": node.parent_id,
+                                    "input_json": node.input_data, "output_json": node.output_data,
+                                    "requires_approval": node.requires_approval})
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
@@ -225,6 +294,13 @@ class GuiController:
         return True
 
     def cancel_task(self) -> None:
+        if self.state.agent_request_running:
+            self.state.agent_request_cancelled = True
+            self.state.agent_request_running = False
+            self.state.agent_status = SystemComponentStatus.IDLE
+            self.append_event("agent_task_cancelled", metadata={"task_id": self.state.current_task_id})
+            self.add_chat_message("Agent request cancelled by user.", sent=False, name="System")
+            return
         if self.state.task_status in {TaskStatus.IDLE, TaskStatus.COMPLETED, TaskStatus.CANCELLED}:
             return
         self.state.task_status = TaskStatus.CANCELLED
