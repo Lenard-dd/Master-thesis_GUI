@@ -21,6 +21,7 @@ class AgentToolEvent:
     output_json: dict[str, Any] = field(default_factory=dict)
     error_message: str | None = None
     requires_approval: bool = False
+    approval_stages: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -50,19 +51,26 @@ class ExistingAgentBridge:
             raise RuntimeError(f"Existing Agent interface is unavailable: {exc}") from exc
 
         decision = proposal.decision
+        approval_stages = [stage.value for stage in proposal.approval_stages]
         if decision.kind == AgentDecisionKind.TOOL_CALL and decision.tool_call:
             call = decision.tool_call
             return AgentResponse(decision.message, [AgentToolEvent(
                 node_id=f"agent-{call.tool_name}-1", parent_id=None,
                 tool_name=call.tool_name, display_name=call.tool_name.replace("_", " ").title(),
                 status="waiting_approval" if proposal.requires_human_gate else "pending",
-                input_json=dict(call.arguments), requires_approval=proposal.requires_human_gate,
+                input_json=dict(call.arguments),
+                output_json={"approval_stages": approval_stages},
+                requires_approval=proposal.requires_human_gate,
+                approval_stages=approval_stages,
             )])
         if decision.kind == AgentDecisionKind.COMPOSITE_SKILL_CALL and decision.composite_skill_call:
             call = decision.composite_skill_call
             return AgentResponse(decision.message, [AgentToolEvent(
                 node_id=f"agent-{call.skill_name}-1", parent_id=None,
                 tool_name=call.skill_name, display_name=call.skill_name.replace("_", " ").title(),
-                status="waiting_approval", input_json=dict(call.arguments), requires_approval=True,
+                status="waiting_approval", input_json=dict(call.arguments),
+                output_json={"approval_stages": approval_stages},
+                requires_approval=True,
+                approval_stages=approval_stages,
             )])
         return AgentResponse(decision.message)

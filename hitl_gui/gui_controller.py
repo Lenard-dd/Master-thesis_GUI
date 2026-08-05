@@ -199,7 +199,10 @@ class GuiController:
         self.append_event("agent_tool_event", node_id=node.node_id, new_value=node.status.value,
                           metadata={"tool_name": node.tool_name, "parent_id": node.parent_id,
                                     "input_json": node.input_data, "output_json": node.output_data,
-                                    "requires_approval": node.requires_approval})
+                                    "requires_approval": node.requires_approval,
+                                    "approval_stages": event.approval_stages})
+        if node.requires_approval and event.approval_stages:
+            self.create_agent_hitl_request(node, event.approval_stages)
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
@@ -280,12 +283,50 @@ class GuiController:
                           metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id})
         return request
 
+    def create_agent_hitl_request(self, node: ToolNode, approval_stages: list[str]) -> HitlRequest | None:
+        """Create a GUI review request for an Agent proposal, not robot motion."""
+        if self.state.pending_hitl_request is not None:
+            return None
+        stage = approval_stages[0]
+        titles = {
+            "task_intent": "Task and target approval required",
+            "grasp_candidate": "Grasp candidate approval required",
+            "trajectory": "Trajectory approval required",
+            "execution": "Execution release required",
+        }
+        descriptions = {
+            "task_intent": "Review the Agent's proposed task and target before it is sent to the Runtime.",
+            "grasp_candidate": "Review the selected grasp candidate before motion planning.",
+            "trajectory": "Review the planned trajectory before motion execution.",
+            "execution": "Confirm the final actuation release. No robot command is sent by this GUI yet.",
+        }
+        request = HitlRequest(
+            request_id=f"agent-review-{uuid.uuid4().hex[:8]}",
+            task_id=self.state.current_task_id or "",
+            request_type=stage,
+            target_id=node.node_id,
+            title=titles.get(stage, "Agent approval required"),
+            description=descriptions.get(stage, "Review the Agent proposal before continuing."),
+            options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.CANCEL],
+            created_at=utc_now(), trajectory_id=None, grasp_candidate_id=None,
+        )
+        self.state.pending_hitl_request = request
+        self.state.task_status = TaskStatus.WAITING_APPROVAL
+        self.append_event(
+            "hitl_requested", node_id=node.node_id, new_value=request.request_id,
+            metadata={"request_id": request.request_id, "request_type": stage,
+                      "approval_stages": approval_stages, "tool_name": node.tool_name},
+        )
+        return request
+
     def submit_hitl_decision(self, request_id: str, decision: HitlDecision) -> bool:
         request = self.state.pending_hitl_request
         if request is None or request.status != "PENDING":
             return False
         if request.request_id != request_id or request.task_id != self.state.current_task_id:
             return False
+        if request.request_type != "trajectory_review":
+            return self._submit_agent_hitl_decision(request, decision)
         if request.trajectory_id != self.state.current_trajectory_id:
             return False
         request.status = decision.value
@@ -307,6 +348,44 @@ class GuiController:
             return True
         self.state.pending_hitl_request = None
         self.runner.submit_decision(decision)
+        return True
+
+    def _submit_agent_hitl_decision(self, request: HitlRequest, decision: HitlDecision) -> bool:
+        """Resolve a plan-only A/B/C/D gate without implying robot execution."""
+        if decision == HitlDecision.REPLAN:
+            return False
+        request.status = decision.value
+        node = self._node(request.target_id)
+        event_type = {
+            HitlDecision.APPROVE: "hitl_approved",
+            HitlDecision.REJECT: "hitl_rejected",
+            HitlDecision.CANCEL: "task_cancelled",
+        }[decision]
+        self.append_event(
+            event_type, node_id=request.target_id, new_value=decision.value,
+            metadata={"request_id": request.request_id, "request_type": request.request_type,
+                      "user_decision": decision.value},
+        )
+        self.state.pending_hitl_request = None
+        if decision == HitlDecision.APPROVE:
+            if node:
+                node.status = ToolStatus.PENDING
+                node.output_data["approval"] = "APPROVED"
+                node.output_summary["approval"] = "APPROVED"
+            self.state.task_status = TaskStatus.APPROVED_PENDING_EXECUTION
+            self.state.agent_status = SystemComponentStatus.READY
+            self.add_chat_message(
+                f"{request.title} approved. The proposal is queued for Agent Runtime; no robot action has been executed.",
+                sent=False, name="System",
+            )
+        else:
+            if node:
+                node.status = ToolStatus.REJECTED if decision == HitlDecision.REJECT else ToolStatus.CANCELLED
+                node.output_data["approval"] = decision.value
+            self.state.task_status = TaskStatus.CANCELLED
+            self.state.agent_status = SystemComponentStatus.IDLE
+            self.add_chat_message("Agent proposal was not approved by the user.", sent=False, name="System")
+        self._refresh_event_views()
         return True
 
     def cancel_task(self) -> None:

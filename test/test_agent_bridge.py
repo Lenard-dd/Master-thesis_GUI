@@ -1,4 +1,5 @@
 from hitl_gui.agent_bridge import AgentResponse, AgentToolEvent, ExistingAgentBridge
+from hitl_gui.app_state import HitlDecision, TaskStatus, ToolStatus
 from hitl_gui.gui_controller import GuiController
 
 
@@ -14,3 +15,21 @@ def test_tool_failure_and_retry_are_preserved_in_history():
     controller.add_agent_tool_event(AgentToolEvent("plan-2", "plan-1", "plan_motion", "Plan Motion Attempt 2", "pending"))
     assert [node.node_id for node in controller.state.tool_nodes[-2:]] == ["plan-1", "plan-2"]
     assert controller.state.tool_nodes[-2].error_message == "blocked"
+
+
+def test_agent_task_intent_approval_has_a_gui_request_and_does_not_execute():
+    controller = GuiController()
+    controller.state.current_task_id = "task-agent-review"
+    controller.add_agent_tool_event(AgentToolEvent(
+        "safe-pick-1", None, "safe_pick_object", "Safe Pick Object",
+        "waiting_approval", requires_approval=True, approval_stages=["task_intent"],
+    ))
+
+    request = controller.state.pending_hitl_request
+    assert request is not None
+    assert request.request_type == "task_intent"
+    assert controller.submit_hitl_decision(request.request_id, HitlDecision.APPROVE)
+    assert controller.state.pending_hitl_request is None
+    assert controller.state.task_status == TaskStatus.APPROVED_PENDING_EXECUTION
+    assert controller.state.tool_nodes[-1].status == ToolStatus.PENDING
+    assert controller.state.tool_nodes[-1].output_data["approval"] == "APPROVED"

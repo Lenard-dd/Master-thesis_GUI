@@ -34,18 +34,18 @@ def create_hitl_panel(controller):
                 if request is not None:
                     controller.submit_hitl_decision(request.request_id, decision)
 
-            decision_buttons = [
-                ui.button("Approve", color="positive", on_click=lambda: submit(HitlDecision.APPROVE)),
-                ui.button("Reject", color="negative", on_click=lambda: submit(HitlDecision.REJECT)),
-                ui.button("Replan", color="primary", on_click=lambda: submit(HitlDecision.REPLAN)),
-            ]
+            approve_button = ui.button("Approve", color="positive", on_click=lambda: submit(HitlDecision.APPROVE))
+            reject_button = ui.button("Reject", color="negative", on_click=lambda: submit(HitlDecision.REJECT))
+            replan_button = ui.button("Replan", color="primary", on_click=lambda: submit(HitlDecision.REPLAN))
             ui.button("Cancel", on_click=controller.cancel_task).props("outline")
 
     def refresh() -> None:
         request_view.refresh()
-        enabled = controller.state.pending_hitl_request is not None
-        for button in decision_buttons:
-            button.set_enabled(enabled)
+        request = controller.state.pending_hitl_request
+        enabled = request is not None
+        approve_button.set_enabled(enabled)
+        reject_button.set_enabled(enabled)
+        replan_button.set_enabled(enabled and request.request_type == "trajectory_review")
 
     refresh()
     return refresh

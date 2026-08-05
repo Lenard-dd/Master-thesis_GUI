@@ -5,6 +5,13 @@ from hitl_gui.app_state import HitlDecision, TaskStatus, ToolStatus
 from hitl_gui.gui_controller import GuiController
 
 
+def mock_controller(*args, **kwargs):
+    """Keep phase-2 workflow tests independent of the user-selected LLM mode."""
+    controller = GuiController(*args, **kwargs)
+    controller.gui_config["agent_bridge"]["mode"] = "mock"
+    return controller
+
+
 async def wait_for_status(controller, status):
     for _ in range(200):
         if controller.state.task_status == status:
@@ -14,7 +21,7 @@ async def wait_for_status(controller, status):
 
 
 async def start_until_approval():
-    controller = GuiController(step_delay=0.001)
+    controller = mock_controller(step_delay=0.001)
     assert controller.start_task("pick the red cube")
     await wait_for_status(controller, TaskStatus.WAITING_APPROVAL)
     return controller
@@ -69,7 +76,7 @@ def test_replan_creates_new_trajectory_and_accepts_only_new_request():
 
 def test_cancel_during_running_task():
     async def scenario():
-        controller = GuiController(step_delay=0.05)
+        controller = mock_controller(step_delay=0.05)
         assert controller.start_task("pick the blue cube")
         await asyncio.sleep(0.005)
         controller.cancel_task()
@@ -107,7 +114,7 @@ def test_replan_records_version_and_invalidated_trajectory():
 
 def test_exported_json_is_readable_and_task_directories_do_not_mix(tmp_path):
     async def scenario():
-        controller = GuiController(step_delay=0.001, log_root=tmp_path)
+        controller = mock_controller(step_delay=0.001, log_root=tmp_path)
         first_id = controller.start_task("first task")
         await wait_for_status(controller, TaskStatus.WAITING_APPROVAL)
         first_dir = controller.export_task_log()
