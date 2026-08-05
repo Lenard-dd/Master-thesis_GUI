@@ -36,6 +36,7 @@ class GuiSkillRuntimeAdapter:
         self._parents[task_id] = parent.node_id
         self._contexts[task_id] = {"task_id": task_id}
         parent.status = ToolStatus.RUNNING
+        self.controller.register_tool_node(parent, append_legacy=False)
         self.controller.state.task_status = TaskStatus.PLANNING
         self.controller.append_event(
             "skill_runtime_started", node_id=parent.node_id,
@@ -89,6 +90,7 @@ class GuiSkillRuntimeAdapter:
                 parent = self._parent(task_id)
                 if parent:
                     parent.status = ToolStatus.FAILED
+                    self.controller.register_tool_node(parent, append_legacy=False)
                 self.controller.state.task_status = TaskStatus.FAILED
                 self.controller.add_chat_message(
                     f"Could not prepare the reviewed grasp motion: {exc}",
@@ -144,6 +146,7 @@ class GuiSkillRuntimeAdapter:
                 error_message="Real grasp verification is not connected to this GUI runtime yet.",
             )
             parent.status = ToolStatus.FAILED
+            self.controller.register_tool_node(parent, append_legacy=False)
             self.controller.state.task_status = TaskStatus.FAILED
             return
         # In simulation the object/contact signal is not available, so retain
@@ -156,6 +159,7 @@ class GuiSkillRuntimeAdapter:
         success = True
         if success:
             parent.status = ToolStatus.SUCCEEDED
+            self.controller.register_tool_node(parent, append_legacy=False)
             self.controller.complete_task()
 
     async def _run_non_motion(self, task_id, parent, skill_id, display_name, parameters, context) -> bool:
@@ -176,6 +180,7 @@ class GuiSkillRuntimeAdapter:
             self.controller.update_tool_status(node.node_id, ToolStatus.FAILED, output_summary=output,
                                                error_message=str(result.get("message", "Tool failed.")))
             parent.status = ToolStatus.FAILED
+            self.controller.register_tool_node(parent, append_legacy=False)
             self.controller.state.task_status = TaskStatus.FAILED
             self.controller.add_chat_message(f"{display_name} could not continue: {result.get('message', 'unknown error')}", sent=False, name="System")
             return False
@@ -215,6 +220,7 @@ class GuiSkillRuntimeAdapter:
         if parent is None or not isinstance(pose, dict):
             if parent:
                 parent.status = ToolStatus.FAILED
+                self.controller.register_tool_node(parent, append_legacy=False)
             self.controller.state.task_status = TaskStatus.FAILED
             self.controller.add_chat_message(f"{display_name} requires a reviewed base_link grasp pose.", sent=False, name="System")
             return
@@ -276,7 +282,7 @@ class GuiSkillRuntimeAdapter:
             plan_version=self.controller.state.current_plan_version,
             input_data=dict(parameters), input_summary=dict(parameters),
         )
-        self.controller.state.tool_nodes.append(node)
+        self.controller.register_tool_node(node)
         return node
 
     def _parent(self, task_id: str) -> ToolNode | None:

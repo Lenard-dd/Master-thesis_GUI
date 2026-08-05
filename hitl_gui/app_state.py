@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
+from hitl_gui.models.task_plan import NodeExecutionAttempt, TaskPlan
+
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -127,6 +129,9 @@ class AppState:
     current_task_id: str | None = None
     current_task_name: str = "None"
     current_plan_version: int = 1
+    current_task_plan: TaskPlan | None = None
+    selected_task_node_id: str | None = None
+    node_attempts: dict[str, list[NodeExecutionAttempt]] = field(default_factory=dict)
     task_status: TaskStatus = TaskStatus.IDLE
     robot_mode: str = "SIMULATION"
     ros_status: SystemComponentStatus = SystemComponentStatus.IDLE

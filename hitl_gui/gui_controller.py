@@ -24,6 +24,8 @@ from hitl_gui.agent_bridge import ExistingAgentBridge
 from hitl_gui.trajectory_review_adapter import ExistingTrajectoryReviewAdapter
 from hitl_gui.runtime_adapters import RuntimeAdapterRegistry, RuntimeBackendConfig
 from hitl_gui.gui_skill_runtime import GuiSkillRuntimeAdapter
+from hitl_gui.task_plan_adapter import TaskPlanAdapter
+from hitl_gui.plan_event_converter import PlanEventConverter
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -79,6 +81,8 @@ class GuiController:
             "GraspGenX": SystemComponentStatus.IDLE,
             "RViz2": SystemComponentStatus.DISCONNECTED,
         })
+        self.task_plan_adapter = TaskPlanAdapter()
+        self.plan_event_converter = PlanEventConverter()
         self.runner = MockTaskRunner(self, step_delay=step_delay)
         self.session_logger = SessionLogger(log_root)
         self.gui_config = load_gui_config()
@@ -154,6 +158,7 @@ class GuiController:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         self.state.current_task_id = task_id
         self.state.current_task_name = task_name
+        self.initialize_task_plan(task_id, task_name)
         self.state.task_status = TaskStatus.UNDERSTANDING_TASK
         self.state.agent_status = SystemComponentStatus.RUNNING
         self.append_event("task_created", new_value=task_name)
@@ -181,6 +186,7 @@ class GuiController:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         self.state.current_task_id = task_id
         self.state.current_task_name = task_name
+        self.initialize_task_plan(task_id, task_name)
         self.state.agent_status = SystemComponentStatus.RUNNING
         self.state.agent_request_running = True
         self.state.agent_request_cancelled = False
@@ -235,7 +241,14 @@ class GuiController:
             error_message=event.error_message, requires_approval=event.requires_approval,
             plan_version=self.state.current_plan_version,
         )
-        self.state.tool_nodes.append(node)
+        self.register_tool_node(node, description=getattr(event, "description", ""))
+        if self.state.current_task_plan is not None:
+            self.plan_event_converter.upsert_tool_event(self.state.current_task_plan, event)
+            self.plan_event_converter.apply_status(
+                self.state.current_task_plan, self.state.node_attempts,
+                node.node_id, node.status.value, input_data=node.input_data,
+                output_data=node.output_data, error_message=node.error_message,
+            )
         self.append_event("agent_tool_event", node_id=node.node_id, new_value=node.status.value,
                           metadata={"tool_name": node.tool_name, "parent_id": node.parent_id,
                                     "input_json": node.input_data, "output_json": node.output_data,
@@ -247,6 +260,51 @@ class GuiController:
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
         self.append_event("chat_message_added", metadata={"sender": name})
+
+    def initialize_task_plan(self, task_id: str, title: str, description: str = ""):
+        """Create the single structured plan owned by AppState."""
+        self.state.current_task_plan = self.task_plan_adapter.create_empty(
+            task_id=task_id, title=title, description=description,
+            version=self.state.current_plan_version,
+        )
+        self.state.selected_task_node_id = None
+        self.state.node_attempts.clear()
+        return self.state.current_task_plan
+
+    def register_tool_node(
+        self, node: ToolNode, *, description: str = "", append_legacy: bool = True,
+    ) -> ToolNode:
+        """Keep legacy ToolNode and the read-only TaskPlan projection in sync."""
+        if append_legacy and self._node(node.node_id) is None:
+            self.state.tool_nodes.append(node)
+        if self.state.current_task_plan is None and self.state.current_task_id:
+            self.initialize_task_plan(
+                self.state.current_task_id, self.state.current_task_name,
+            )
+        plan = self.state.current_task_plan
+        if plan is not None:
+            task_node = self.task_plan_adapter.from_tool_node(
+                node, sequence_index=(
+                    plan.node_ids.index(node.node_id)
+                    if node.node_id in plan.node_ids else len(plan.node_ids)
+                ),
+            )
+            task_node.description = description
+            self.task_plan_adapter.upsert_node(plan, task_node)
+            self.plan_event_converter.apply_status(
+                plan, self.state.node_attempts, node.node_id, node.status.value,
+                input_data=node.input_data, output_data=node.output_data,
+                error_message=node.error_message,
+                trajectory_id=node.output_data.get("trajectory_id"),
+            )
+        return node
+
+    def set_plan_version(self, version: int) -> None:
+        """Update both compatibility state and the structured plan version."""
+        self.state.current_plan_version = int(version)
+        if self.state.current_task_plan is not None:
+            self.state.current_task_plan.version = int(version)
+            self.state.current_task_plan.touch()
 
     def clear_conversation(self) -> None:
         self.state.conversation.clear()
@@ -262,6 +320,8 @@ class GuiController:
             )
             for name in FLOW
         ]
+        for node in self.state.tool_nodes:
+            self.register_tool_node(node, append_legacy=False)
         self.append_event("tool_tree_initialized")
 
     def update_tool_status(self, node_id: str, status: ToolStatus, **output: Any) -> bool:
@@ -298,6 +358,13 @@ class GuiController:
                       "input_summary": node.input_summary, "output_summary": node.output_summary,
                       "error_message": node.error_message},
         )
+        if self.state.current_task_plan is not None:
+            self.plan_event_converter.apply_status(
+                self.state.current_task_plan, self.state.node_attempts,
+                node_id, status.value, input_data=node.input_data,
+                output_data=node.output_data, error_message=node.error_message,
+                trajectory_id=node.output_data.get("trajectory_id"),
+            )
         return True
 
     def create_trajectory(self) -> str:
@@ -462,7 +529,7 @@ class GuiController:
             output_summary={"trajectory_id": trajectory_id,
                             "trajectory_points": summary.get("num_trajectory_points", 0)},
         )
-        self.state.tool_nodes.append(review_node)
+        self.register_tool_node(review_node)
         request = HitlRequest(
             request_id=f"trajectory-review-{uuid.uuid4().hex[:8]}",
             task_id=self.state.current_task_id or "", request_type="trajectory_review",
@@ -477,6 +544,18 @@ class GuiController:
             target_summary=record.target_summary,
         )
         self.state.pending_hitl_request = request
+        if self.state.current_task_plan is not None:
+            self.plan_event_converter.bind_review_ids(
+                self.state.current_task_plan, self.state.node_attempts,
+                review_node_id, trajectory_id=trajectory_id,
+                request_id=request.request_id,
+            )
+            if source_node_id:
+                self.plan_event_converter.bind_review_ids(
+                    self.state.current_task_plan, self.state.node_attempts,
+                    source_node_id, trajectory_id=trajectory_id,
+                    request_id=request.request_id,
+                )
         self.state.task_status = TaskStatus.WAITING_APPROVAL
         self.append_event("hitl_requested", node_id=review_node_id, new_value=request.request_id,
                           metadata={"request_id": request.request_id, "trajectory_id": trajectory_id,
@@ -511,7 +590,14 @@ class GuiController:
             options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.CANCEL],
             created_at=utc_now(), trajectory_id=None, grasp_candidate_id=None,
         )
+        self.register_tool_node(node, append_legacy=False)
         self.state.pending_hitl_request = request
+        if self.state.current_task_plan is not None:
+            self.plan_event_converter.bind_review_ids(
+                self.state.current_task_plan, self.state.node_attempts,
+                node.node_id, trajectory_id=request.trajectory_id,
+                request_id=request.request_id,
+            )
         self.state.task_status = TaskStatus.WAITING_APPROVAL
         self.append_event(
             "hitl_requested", node_id=node.node_id, new_value=request.request_id,
@@ -573,6 +659,7 @@ class GuiController:
         if decision in {HitlDecision.REJECT, HitlDecision.CANCEL}:
             if node:
                 node.status = ToolStatus.REJECTED if decision == HitlDecision.REJECT else ToolStatus.CANCELLED
+                self.register_tool_node(node, append_legacy=False)
             self.state.task_status = TaskStatus.CANCELLED
             self.append_event("hitl_rejected" if decision == HitlDecision.REJECT else "task_cancelled",
                               node_id=request.target_id, new_value=decision.value,
@@ -583,6 +670,7 @@ class GuiController:
             return False
         if node:
             node.status = ToolStatus.SUCCEEDED
+            self.register_tool_node(node, append_legacy=False)
         self.state.task_status = TaskStatus.EXECUTING
         self.append_event("hitl_approved", node_id=request.target_id, new_value=decision.value,
                           metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id,
@@ -638,8 +726,15 @@ class GuiController:
         review = self._node(request.target_id)
         if review:
             review.status = ToolStatus.INVALIDATED
+            self.register_tool_node(review, append_legacy=False)
+        source_node = self._node(review.parent_id) if review and review.parent_id else None
+        if source_node:
+            self.update_tool_status(
+                source_node.node_id, ToolStatus.INVALIDATED,
+                output_summary={"trajectory_id": trajectory_id, "replan_reason": reason},
+            )
         old_version = self.state.current_plan_version
-        self.state.current_plan_version += 1
+        self.set_plan_version(self.state.current_plan_version + 1)
         self.append_event("trajectory_invalidated", node_id=request.target_id,
                           metadata={"trajectory_id": trajectory_id, "request_id": request.request_id,
                                     "reason": reason})
@@ -647,6 +742,13 @@ class GuiController:
                           metadata={"reason": reason})
         target = record.summary.get("target_name")
         source_node_id = review.parent_id if review else None
+        if source_node:
+            source_node.plan_version = self.state.current_plan_version
+            self.register_tool_node(source_node, append_legacy=False)
+            self.update_tool_status(
+                source_node.node_id, ToolStatus.RUNNING,
+                input_summary={"replan_reason": reason},
+            )
         if target:
             self.request_named_target_trajectory(target, source_node_id=source_node_id)
         elif record.planning_request.get("kind") == "pose":
@@ -726,6 +828,8 @@ class GuiController:
             self.state.task_status = TaskStatus.CANCELLED
             self.state.agent_status = SystemComponentStatus.IDLE
             self.add_chat_message("Agent proposal was not approved by the user.", sent=False, name="System")
+        if node:
+            self.register_tool_node(node, append_legacy=False)
         self._refresh_event_views()
         return True
 
@@ -778,16 +882,18 @@ class GuiController:
             self.append_event("trajectory_invalidated", node_id=old_review.node_id,
                               metadata={"trajectory_id": self.state.current_trajectory_id})
         old_version = self.state.current_plan_version
-        self.state.current_plan_version += 1
+        self.set_plan_version(self.state.current_plan_version + 1)
         self.append_event("plan_version_changed", old_value=old_version,
                           new_value=self.state.current_plan_version)
         attempt = self.state.current_plan_version
         plan_id = f"plan_motion_attempt_{attempt}"
         review_id = f"trajectory_review_attempt_{attempt}"
-        self.state.tool_nodes.extend([
-            ToolNode(plan_id, "plan_motion", "plan_motion", f"Plan Motion (Attempt {attempt})", plan_version=attempt),
-            ToolNode(review_id, "trajectory_review", "trajectory_review", f"Trajectory Review (Attempt {attempt})", requires_approval=True, plan_version=attempt),
-        ])
+        self.register_tool_node(
+            ToolNode(plan_id, "plan_motion", "plan_motion", f"Plan Motion (Attempt {attempt})", plan_version=attempt)
+        )
+        self.register_tool_node(
+            ToolNode(review_id, "trajectory_review", "trajectory_review", f"Trajectory Review (Attempt {attempt})", requires_approval=True, plan_version=attempt)
+        )
         self.set_task_status(TaskStatus.PLANNING)
         self.update_tool_status(plan_id, ToolStatus.RUNNING)
         self.update_tool_status(plan_id, ToolStatus.SUCCEEDED)
@@ -818,6 +924,9 @@ class GuiController:
     def append_event(self, event_type: str, *, node_id: str | None = None, old_value: Any = None, new_value: Any = None, metadata: dict[str, Any] | None = None) -> ExecutionEvent:
         event = ExecutionEvent(f"event-{uuid.uuid4().hex[:8]}", self.state.current_task_id, node_id, event_type, utc_now(), self.state.current_plan_version, old_value, new_value, metadata or {})
         self.state.event_log.append(event)
+        if self.state.current_task_plan is not None:
+            self.state.current_task_plan.status = self.state.task_status.value
+            self.state.current_task_plan.touch()
         if event_type in {"hitl_approved", "hitl_rejected", "hitl_replan_requested", "plan_version_changed"}:
             self.state.modification_history.append(event)
         if self._log_renderer is not None:
@@ -835,6 +944,9 @@ class GuiController:
         self.state.current_task_id = None
         self.state.current_task_name = "None"
         self.state.current_plan_version = 1
+        self.state.current_task_plan = None
+        self.state.selected_task_node_id = None
+        self.state.node_attempts.clear()
         self.state.task_status = TaskStatus.IDLE
         self.state.agent_status = SystemComponentStatus.IDLE
         self.state.tool_nodes.clear()

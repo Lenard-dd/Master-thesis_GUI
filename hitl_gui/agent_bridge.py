@@ -22,6 +22,11 @@ class AgentToolEvent:
     error_message: str | None = None
     requires_approval: bool = False
     approval_stages: list[str] = field(default_factory=list)
+    description: str = ""
+    node_type: str = "tool"
+    phase: str | None = None
+    sequence_index: int | None = None
+    dependencies: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -56,6 +61,7 @@ class ExistingAgentBridge:
         approval_stages = [stage.value for stage in proposal.approval_stages]
         if decision.kind == AgentDecisionKind.TOOL_CALL and decision.tool_call:
             call = decision.tool_call
+            plan_step = proposal.plan_step
             return AgentResponse(decision.message, [AgentToolEvent(
                 node_id=f"agent-{call.tool_name}-1", parent_id=None,
                 tool_name=call.tool_name, display_name=call.tool_name.replace("_", " ").title(),
@@ -64,6 +70,8 @@ class ExistingAgentBridge:
                 output_json={"approval_stages": approval_stages},
                 requires_approval=proposal.requires_human_gate,
                 approval_stages=approval_stages,
+                description=plan_step.description if plan_step is not None else "",
+                node_type="tool",
             )])
         if decision.kind == AgentDecisionKind.COMPOSITE_SKILL_CALL and decision.composite_skill_call:
             call = decision.composite_skill_call
@@ -74,6 +82,8 @@ class ExistingAgentBridge:
                 output_json={"approval_stages": approval_stages},
                 requires_approval=True,
                 approval_stages=approval_stages,
+                description=getattr(proposal.composite_skill, "description", ""),
+                node_type="composite",
             )])
         return AgentResponse(decision.message)
 
