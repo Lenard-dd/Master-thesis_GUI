@@ -7,7 +7,7 @@ from hitl_gui.message_converter import heartbeat_status
 
 def test_ros_unavailable_keeps_mock_gui_usable():
     controller = GuiController(step_delay=0.001)
-    assert controller.state.robot_mode == "MOCK"
+    assert controller.state.robot_mode == "SIMULATION"
     assert controller.ros_worker is None
     assert controller.state.task_status.value == "IDLE"
 
@@ -31,4 +31,4 @@ def test_ros_worker_error_does_not_break_controller():
     controller.ros_worker = FailedWorker()
     controller.consume_ros_status()
     assert controller.state.ros_status == SystemComponentStatus.ERROR
-    assert controller.state.robot_mode == "MOCK"
+    assert controller.state.robot_mode == "SIMULATION"

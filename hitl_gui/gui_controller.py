@@ -8,6 +8,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+import yaml
+
 from hitl_gui.app_state import (
     AppState, ChatEntry, ExecutionEvent, HitlDecision, HitlRequest,
     SystemComponentStatus, TaskStatus, ToolNode, ToolStatus, utc_now,
@@ -19,6 +21,7 @@ from hitl_gui.ros_worker import RosWorker
 from hitl_gui.message_converter import component_status
 from hitl_gui.component_process_manager import ComponentProcessManager
 from hitl_gui.agent_bridge import ExistingAgentBridge
+from hitl_gui.trajectory_review_adapter import ExistingTrajectoryReviewAdapter
 from nicegui import ui
 from hitl_gui.panels.chat_panel import create_chat_panel
 from hitl_gui.panels.header_panel import create_header_panel
@@ -59,6 +62,10 @@ class GuiController:
         # created during controller construction, before a panel exists.
         self._log_renderer = None
         self._event_renderers = []
+        self.trajectory_adapter = None
+        self._invalidated_trajectory_ids: set[str] = set()
+        self._last_trajectory_task = None
+        self._last_execution_task = None
         self.state = AppState(hardware_status={
             "ROS 2": SystemComponentStatus.IDLE,
             "UR5": SystemComponentStatus.DISCONNECTED,
@@ -73,6 +80,7 @@ class GuiController:
         self.session_logger = SessionLogger(log_root)
         self.gui_config = load_gui_config()
         self.agent_name = self.gui_config.get("agent_bridge", {}).get("display_name", "Milo")
+        self.state.robot_mode = self.gui_config.get("mode", "SIMULATION").upper()
         rviz_settings = self.gui_config.get("rviz", {})
         self.rviz_manager = RvizProcessManager(
             rviz_settings.get("config_path", ""),
@@ -300,10 +308,109 @@ class GuiController:
             options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.REPLAN, HitlDecision.CANCEL],
             created_at=utc_now(), trajectory_id=self.state.current_trajectory_id,
             grasp_candidate_id=None,
+            plan_version=self.state.current_plan_version,
         )
         self.state.pending_hitl_request = request
         self.append_event("hitl_requested", node_id="trajectory_review", new_value=request.request_id,
                           metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id})
+        return request
+
+    def set_trajectory_adapter(self, adapter: ExistingTrajectoryReviewAdapter) -> None:
+        """Inject the existing MoveIt-backed adapter (also used by unit tests)."""
+        self.trajectory_adapter = adapter
+
+    def _ensure_trajectory_adapter(self) -> ExistingTrajectoryReviewAdapter:
+        if self.trajectory_adapter is not None:
+            return self.trajectory_adapter
+        if self.ros_worker is None:
+            raise RuntimeError("ROS monitoring must be enabled before requesting a MoveIt trajectory.")
+        from llm_skill_robot.core.execution_mode import load_execution_config
+        from llm_skill_robot.core.trajectory_validator import TrajectoryValidator
+        from llm_skill_robot.core.trajectory_visualizer import TrajectoryVisualizer
+        from llm_skill_robot.robot.ur5_moveit_plan_backend import UR5MoveItPlanBackend
+        from llm_skill_robot.safety.hardware_mode import load_hardware_mode
+
+        real_robot = self.state.robot_mode in {"REAL", "REAL ROBOT"}
+        execution_config = load_execution_config().model_dump()
+        execution_config["mode"] = "real_robot" if real_robot else "rviz_sim"
+        if not real_robot:
+            execution_config["allowed_execution_modes"] = list(
+                set(execution_config.get("allowed_execution_modes", [])) | {"rviz_sim"}
+            )
+        backend = UR5MoveItPlanBackend(
+            dry_run=False,
+            mode=execution_config["mode"],
+            execution_config=execution_config,
+            hardware_mode=load_hardware_mode(),
+        )
+        self.trajectory_adapter = ExistingTrajectoryReviewAdapter(
+            backend,
+            TrajectoryValidator(self._load_safety_config()),
+            TrajectoryVisualizer(node=backend.node, topic=execution_config.get("visual_preview_topic", "/display_planned_path")),
+        )
+        return self.trajectory_adapter
+
+    def request_named_target_trajectory(self, target: str, *, source_node_id: str | None = None):
+        """Schedule existing MoveIt planning; never create a new execution path."""
+        self._last_trajectory_task = asyncio.create_task(self._plan_named_target_trajectory(target, source_node_id))
+        return self._last_trajectory_task
+
+    async def _plan_named_target_trajectory(self, target: str, source_node_id: str | None) -> None:
+        self.state.task_status = TaskStatus.PLANNING
+        self.append_event("trajectory_planning_started", node_id=source_node_id, metadata={"target": target})
+        try:
+            adapter = self._ensure_trajectory_adapter()
+            if adapter.run_in_worker:
+                record = await asyncio.to_thread(adapter.plan_named_target, target, self.state.current_plan_version)
+            else:
+                record = adapter.plan_named_target(target, self.state.current_plan_version)
+        except Exception as exc:
+            self.state.task_status = TaskStatus.FAILED
+            self.append_event("tool_failed", node_id=source_node_id, metadata={"reason": str(exc), "target": target})
+            self.add_chat_message(f"MoveIt planning failed: {exc}", sent=False, name="System")
+            return
+        self._create_trajectory_review_request(record, source_node_id)
+        # Publishing one DisplayTrajectory is non-blocking; keeping it on this
+        # coroutine also avoids racing a planning worker with a second executor.
+        preview = adapter.preview(record.trajectory_id)
+        self.append_event("trajectory_preview_published", node_id=source_node_id,
+                          metadata={"trajectory_id": record.trajectory_id, "preview": preview})
+
+    def _create_trajectory_review_request(self, record, source_node_id: str | None) -> HitlRequest:
+        summary = record.summary
+        trajectory_id = record.trajectory_id
+        self.state.current_trajectory_id = trajectory_id
+        review_node_id = f"trajectory_review_attempt_{record.plan_version}"
+        review_node = ToolNode(
+            node_id=review_node_id, parent_id=source_node_id, tool_name="trajectory_review",
+            display_name=f"Trajectory Review (Attempt {record.plan_version})",
+            status=ToolStatus.WAITING_APPROVAL, requires_approval=True,
+            plan_version=record.plan_version,
+            output_data={"trajectory_id": trajectory_id, "summary": summary,
+                         "validation": record.validation_result},
+            output_summary={"trajectory_id": trajectory_id,
+                            "trajectory_points": summary.get("num_trajectory_points", 0)},
+        )
+        self.state.tool_nodes.append(review_node)
+        request = HitlRequest(
+            request_id=f"trajectory-review-{uuid.uuid4().hex[:8]}",
+            task_id=self.state.current_task_id or "", request_type="trajectory_review",
+            target_id=review_node_id, title="Trajectory approval required",
+            description="Review the MoveIt trajectory in RViz before it is executed.",
+            options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.REPLAN, HitlDecision.CANCEL],
+            created_at=utc_now(), trajectory_id=trajectory_id, grasp_candidate_id=None,
+            plan_version=record.plan_version, planning_success=bool(summary.get("success")),
+            trajectory_points=int(summary.get("num_trajectory_points", 0)),
+            trajectory_duration=summary.get("duration_sec"), planning_time=record.planning_time_ms,
+            collision_check=record.validation_result.get("decision", "UNKNOWN"),
+            target_summary=record.target_summary,
+        )
+        self.state.pending_hitl_request = request
+        self.state.task_status = TaskStatus.WAITING_APPROVAL
+        self.append_event("hitl_requested", node_id=review_node_id, new_value=request.request_id,
+                          metadata={"request_id": request.request_id, "trajectory_id": trajectory_id,
+                                    "plan_version": record.plan_version, "planning_success": request.planning_success,
+                                    "collision_check": request.collision_check})
         return request
 
     def create_agent_hitl_request(self, node: ToolNode, approval_stages: list[str]) -> HitlRequest | None:
@@ -342,7 +449,7 @@ class GuiController:
         )
         return request
 
-    def submit_hitl_decision(self, request_id: str, decision: HitlDecision) -> bool:
+    def submit_hitl_decision(self, request_id: str, decision: HitlDecision, *, real_confirmed: bool = False) -> bool:
         request = self.state.pending_hitl_request
         if request is None or request.status != "PENDING":
             return False
@@ -350,8 +457,20 @@ class GuiController:
             return False
         if request.request_type != "trajectory_review":
             return self._submit_agent_hitl_decision(request, decision)
+        if request.plan_version != self.state.current_plan_version:
+            return False
         if request.trajectory_id != self.state.current_trajectory_id:
             return False
+        if request.trajectory_id in self._invalidated_trajectory_ids:
+            return False
+        if (
+            decision == HitlDecision.APPROVE
+            and self.state.robot_mode in {"REAL", "REAL ROBOT"}
+            and not real_confirmed
+        ):
+            return False
+        if self.trajectory_adapter is not None and request.trajectory_id in self.trajectory_adapter.records:
+            return self._submit_existing_trajectory_decision(request, decision)
         request.status = decision.value
         review = self._active_trajectory_review()
         if review:
@@ -371,6 +490,89 @@ class GuiController:
             return True
         self.state.pending_hitl_request = None
         self.runner.submit_decision(decision)
+        return True
+
+    def _submit_existing_trajectory_decision(self, request: HitlRequest, decision: HitlDecision) -> bool:
+        """Resolve a GUI review against the exact cached MoveIt plan only."""
+        if decision == HitlDecision.REPLAN:
+            return self.replan_trajectory(request.request_id, "other")
+        request.status = decision.value
+        self.state.pending_hitl_request = None
+        node = self._node(request.target_id)
+        if decision in {HitlDecision.REJECT, HitlDecision.CANCEL}:
+            if node:
+                node.status = ToolStatus.REJECTED if decision == HitlDecision.REJECT else ToolStatus.CANCELLED
+            self.state.task_status = TaskStatus.CANCELLED
+            self.append_event("hitl_rejected" if decision == HitlDecision.REJECT else "task_cancelled",
+                              node_id=request.target_id, new_value=decision.value,
+                              metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id,
+                                        "plan_version": request.plan_version})
+            return True
+        if decision != HitlDecision.APPROVE:
+            return False
+        if node:
+            node.status = ToolStatus.SUCCEEDED
+        self.state.task_status = TaskStatus.EXECUTING
+        self.append_event("hitl_approved", node_id=request.target_id, new_value=decision.value,
+                          metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id,
+                                    "plan_version": request.plan_version})
+        self._last_execution_task = asyncio.create_task(self._execute_existing_trajectory(request))
+        return True
+
+    async def _execute_existing_trajectory(self, request: HitlRequest) -> None:
+        trajectory_id = request.trajectory_id
+        if trajectory_id is None or trajectory_id != self.state.current_trajectory_id or trajectory_id in self._invalidated_trajectory_ids:
+            return
+        self.append_event("execution_started", node_id=request.target_id,
+                          metadata={"trajectory_id": trajectory_id, "plan_version": request.plan_version})
+        try:
+            real_robot = self.state.robot_mode in {"REAL", "REAL ROBOT"}
+            if self.trajectory_adapter.run_in_worker:
+                result = await asyncio.to_thread(self.trajectory_adapter.execute, trajectory_id, real_robot=real_robot)
+            else:
+                result = self.trajectory_adapter.execute(trajectory_id, real_robot=real_robot)
+        except Exception as exc:
+            result = {"success": False, "message": str(exc), "plan_id": trajectory_id}
+        if trajectory_id != self.state.current_trajectory_id or trajectory_id in self._invalidated_trajectory_ids:
+            return
+        success = bool(result.get("success"))
+        event_type = "execution_succeeded" if success else "execution_failed"
+        self.state.task_status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
+        self.append_event(event_type, node_id=request.target_id,
+                          metadata={"trajectory_id": trajectory_id, "plan_version": request.plan_version,
+                                    "execution_duration": result.get("execution_duration"),
+                                    "controller_result": result})
+        self.add_chat_message(result.get("message", "Trajectory execution finished."), sent=False, name="System")
+
+    def replan_trajectory(self, request_id: str, reason: str) -> bool:
+        request = self.state.pending_hitl_request
+        if request is None or request.request_id != request_id or request.request_type != "trajectory_review":
+            return False
+        trajectory_id = request.trajectory_id
+        if trajectory_id is None or self.trajectory_adapter is None:
+            return False
+        record = self.trajectory_adapter.records.get(trajectory_id)
+        if record is None or record.invalidated:
+            return False
+        request.status = "INVALIDATED"
+        record.invalidated = True
+        self._invalidated_trajectory_ids.add(trajectory_id)
+        self.state.pending_hitl_request = None
+        review = self._node(request.target_id)
+        if review:
+            review.status = ToolStatus.INVALIDATED
+        old_version = self.state.current_plan_version
+        self.state.current_plan_version += 1
+        self.append_event("trajectory_invalidated", node_id=request.target_id,
+                          metadata={"trajectory_id": trajectory_id, "request_id": request.request_id,
+                                    "reason": reason})
+        self.append_event("plan_version_changed", old_value=old_version, new_value=self.state.current_plan_version,
+                          metadata={"reason": reason})
+        target = record.summary.get("target_name")
+        if not target:
+            self.state.task_status = TaskStatus.FAILED
+            return False
+        self.request_named_target_trajectory(target, source_node_id=review.parent_id if review else None)
         return True
 
     def _submit_agent_hitl_decision(self, request: HitlRequest, decision: HitlDecision) -> bool:
@@ -401,6 +603,10 @@ class GuiController:
                 f"{request.title} approved. The proposal is queued for Agent Runtime; no robot action has been executed.",
                 sent=False, name="System",
             )
+            if node and node.tool_name == "move_to_named_target":
+                target = node.input_data.get("target_name") or node.input_data.get("target")
+                if target:
+                    self.request_named_target_trajectory(str(target), source_node_id=node.node_id)
         else:
             if node:
                 node.status = ToolStatus.REJECTED if decision == HitlDecision.REJECT else ToolStatus.CANCELLED
@@ -410,6 +616,15 @@ class GuiController:
             self.add_chat_message("Agent proposal was not approved by the user.", sent=False, name="System")
         self._refresh_event_views()
         return True
+
+    @staticmethod
+    def _load_safety_config() -> dict:
+        try:
+            from llm_skill_robot.utils import get_config_dir
+            path = get_config_dir() / "safety.yaml"
+            return yaml.safe_load(path.read_text(encoding="utf-8")) or {} if path.exists() else {}
+        except Exception:
+            return {}
 
     def cancel_task(self) -> None:
         if self.state.agent_request_running:
@@ -548,6 +763,18 @@ class GuiController:
         self.append_event("trajectory_preview_requested", node_id="trajectory_review",
                           metadata={"trajectory_id": self.state.current_trajectory_id, "mode": "mock"})
 
+    def preview_current_trajectory(self) -> None:
+        trajectory_id = self.state.current_trajectory_id
+        if self.trajectory_adapter is None or trajectory_id is None:
+            self.request_trajectory_preview()
+            return
+        asyncio.create_task(self._preview_existing_trajectory(trajectory_id))
+
+    async def _preview_existing_trajectory(self, trajectory_id: str) -> None:
+        result = self.trajectory_adapter.preview(trajectory_id)
+        self.append_event("trajectory_preview_requested", node_id="trajectory_review",
+                          metadata={"trajectory_id": trajectory_id, "preview": result})
+
     def shutdown(self) -> None:
         self.stop_rviz()
         if self.ros_worker:
@@ -560,6 +787,10 @@ class GuiController:
     def start_component(self, component_id: str, *, confirmed: bool = False):
         self.append_event("component_start_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
         managed = self.component_manager.start_component(component_id, confirmed=confirmed)
+        if component_id == "ur5_fake" and managed.status.value == "RUNNING":
+            self.state.robot_mode = "SIMULATION"
+        elif component_id == "ur5_real" and managed.status.value == "RUNNING":
+            self.state.robot_mode = "REAL ROBOT"
         event = "component_started" if managed.status.value == "RUNNING" else "component_start_failed"
         self.append_event(event, metadata={"component_id": component_id, "command_summary": managed.command, "pid": managed.pid, "robot_mode": component_id, "initiated_by": "gui"})
         self.refresh_component_processes()
@@ -624,7 +855,6 @@ class GuiController:
 
     def set_gui_mode(self, mode: str) -> None:
         mode = mode.upper()
-        self.state.robot_mode = mode
         if mode == "ROS":
             self.ros_worker = RosWorker(self.gui_config.get("ros_monitor", {}))
             self.ros_worker.start()

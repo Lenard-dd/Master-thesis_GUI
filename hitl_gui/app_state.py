@@ -100,6 +100,13 @@ class HitlRequest:
     trajectory_id: str | None
     grasp_candidate_id: str | None
     status: str = "PENDING"
+    plan_version: int = 1
+    planning_success: bool = False
+    trajectory_points: int = 0
+    trajectory_duration: float | None = None
+    planning_time: int | None = None
+    collision_check: str = "UNKNOWN"
+    target_summary: str = ""
 
 
 @dataclass
