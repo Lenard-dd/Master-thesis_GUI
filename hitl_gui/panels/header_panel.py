@@ -7,7 +7,7 @@ def create_header_panel(controller):
         state = controller.state
         with ui.card().classes("w-full"):
             with ui.row().classes("w-full items-center justify-between gap-4"):
-                ui.label("LLM Robot HITL Interface").classes("text-2xl font-bold text-primary")
+                ui.label("Robot Collaboration Studio").classes("text-2xl font-bold text-primary")
                 with ui.row().classes("items-center gap-3 text-sm"):
                     ui.badge(f"Mode: {state.robot_mode}", color="primary")
                     ui.badge(f"ROS: {state.ros_status.value}", color="grey-7")

@@ -24,7 +24,7 @@ def main() -> None:
         controller.set_gui_mode(args.mode)
     app.on_shutdown(controller.shutdown)
     ui.page("/")(controller.build_page)
-    ui.run(host=args.host, port=args.port, reload=False, title="LLM Robot HITL Interface")
+    ui.run(host=args.host, port=args.port, reload=False, title="Milo Robot Collaboration Studio")
 
 
 if __name__ == "__main__":

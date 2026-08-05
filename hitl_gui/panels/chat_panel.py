@@ -3,7 +3,7 @@ from nicegui import ui
 
 def create_chat_panel(controller):
     with ui.card().classes("w-full h-full min-h-[520px]"):
-        ui.label("Agent Chat").classes("text-lg font-semibold")
+        ui.label("Chat").classes("text-lg font-semibold")
 
         # Keep the actual scroll container outside the refreshable region.
         # Re-creating the container on every UI refresh resets its position to
