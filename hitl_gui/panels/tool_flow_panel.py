@@ -35,4 +35,9 @@ def create_tool_flow_panel(controller):
 
         content()
         details()
-    return content
+
+    def refresh() -> None:
+        content.refresh()
+        details.refresh()
+
+    return refresh

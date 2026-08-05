@@ -48,6 +48,10 @@ class GuiController:
     """Coordinates state changes while remaining entirely mock-only."""
 
     def __init__(self, step_delay: float = 0.6, log_root: str = "logs") -> None:
+        # Assigned once a browser page is built. Audit events may also be
+        # created during controller construction, before a panel exists.
+        self._log_renderer = None
+        self._event_renderers = []
         self.state = AppState(hardware_status={
             "ROS 2": SystemComponentStatus.IDLE,
             "UR5": SystemComponentStatus.DISCONNECTED,
@@ -75,19 +79,28 @@ class GuiController:
         ui.colors(primary="#1d4f91", secondary="#546e7a", accent="#1976d2")
         ui.add_head_html("<style>body { background: #f5f7fa; }</style>")
         with ui.column().classes("w-full min-h-screen gap-4 p-4"):
-            renderers = [create_header_panel(self)]
+            header_renderer = create_header_panel(self)
+            renderers = []
             with ui.splitter(value=32).classes("w-full flex-grow min-h-[520px]") as outer:
                 with outer.before:
-                    renderers.append(create_chat_panel(self))
+                    chat_renderer = create_chat_panel(self)
                 with outer.after:
                     with ui.splitter(value=64).classes("w-full h-full") as inner:
                         with inner.before:
-                            renderers.append(create_tool_flow_panel(self))
+                            tool_flow_renderer = create_tool_flow_panel(self)
                         with inner.after:
                             renderers.append(create_status_panel(self))
-            renderers.append(create_hitl_panel(self))
-            renderers.append(create_log_panel(self))
-            renderers.append(create_component_log_panel(self))
+            hitl_renderer = create_hitl_panel(self)
+            # Audit log updates are event-driven. Keeping it out of the ROS
+            # monitor's 5 Hz renderer list preserves pagination and selection.
+            self._log_renderer = create_log_panel(self)
+            component_log_renderer = create_component_log_panel(self)
+        self._event_renderers = [header_renderer.refresh, chat_renderer, tool_flow_renderer, hitl_renderer]
+        # Header contains ROS state, while component output arrives from child
+        # processes. They need periodic updates, but not monitor-frequency UI
+        # reconstruction.
+        ui.timer(1.0, header_renderer.refresh)
+        ui.timer(1.0, component_log_renderer.refresh)
         refresh_hz = self.gui_config.get("ros_monitor", {}).get("refresh_hz", 5)
         ui.timer(1.0 / max(1, refresh_hz), lambda: self._refresh_ui(renderers))
 
@@ -163,6 +176,9 @@ class GuiController:
         finally:
             self.state.agent_request_running = False
             self.state.agent_status = SystemComponentStatus.IDLE
+            # No audit event is emitted for this internal completion flag, but
+            # Chat owns the Send button state and must re-enable it promptly.
+            self._refresh_event_views()
 
     def add_agent_tool_event(self, event) -> None:
         status_map = {
@@ -374,7 +390,15 @@ class GuiController:
         self.state.event_log.append(event)
         if event_type in {"hitl_approved", "hitl_rejected", "hitl_replan_requested", "plan_version_changed"}:
             self.state.modification_history.append(event)
+        if self._log_renderer is not None:
+            self._log_renderer.refresh()
+        self._refresh_event_views()
         return event
+
+    def _refresh_event_views(self) -> None:
+        """Refresh state-machine views only when their underlying data changes."""
+        for renderer in self._event_renderers:
+            renderer()
 
     def reset_task(self, *, clear_conversation: bool = True) -> None:
         self.runner.cancel()

@@ -17,6 +17,7 @@ def _category(event) -> str:
 
 def create_log_panel(controller):
     selected = {"event": None}
+    table_state = {"page": 1, "rows_per_page": 8}
     filter_select = ui.select(["All", "Tool", "HITL", "Error", "User Modification"], value="All", label="Filter").classes("w-48")
 
     @ui.refreshable
@@ -59,6 +60,13 @@ def create_log_panel(controller):
             selected["event"] = next((item for item in controller.state.event_log if item.event_id == selected_id), None)
             details.refresh()
 
+        def keep_pagination(event_args):
+            # The table is refreshed with the rest of the GUI. Retain the
+            # browser-selected page so that a refresh does not force page one.
+            pagination = event_args.value
+            table_state["page"] = pagination.get("page", 1)
+            table_state["rows_per_page"] = pagination.get("rowsPerPage", 8)
+
         with ui.card().classes("w-full"):
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label("Execution Log").classes("text-lg font-semibold")
@@ -79,10 +87,15 @@ def create_log_panel(controller):
                 ], rows=rows, row_key="event_id", selection="single", on_select=select_row,
                 # Pagination prevents the audit table from growing with the
                 # event history while retaining row selection and details.
-                pagination=8,
+                pagination={"page": table_state["page"], "rowsPerPage": table_state["rows_per_page"]},
+                on_pagination_change=keep_pagination,
             ).classes("w-full")
 
-    filter_select.on_value_change(lambda _: content.refresh())
+    def refresh_for_filter(_):
+        table_state["page"] = 1
+        content.refresh()
+
+    filter_select.on_value_change(refresh_for_filter)
     content()
     details()
     return content

@@ -45,5 +45,8 @@ def create_chat_panel(controller):
             ui.button("Clear", on_click=controller.clear_conversation).props("outline")
             ui.button("Stop Task", on_click=controller.cancel_task, color="negative").props("outline")
         task_input.on("keydown.enter", send_message)
-        ui.timer(0.2, lambda: send_button.set_enabled(not controller.state.agent_request_running))
-    return messages_view
+    def refresh() -> None:
+        messages_view.refresh()
+        send_button.set_enabled(not controller.state.agent_request_running)
+
+    return refresh
