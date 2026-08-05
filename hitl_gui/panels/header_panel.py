@@ -11,7 +11,7 @@ def create_header_panel(controller):
                 with ui.row().classes("items-center gap-3 text-sm"):
                     ui.badge(f"Mode: {state.robot_mode}", color="primary")
                     ui.badge(f"ROS: {state.ros_status.value}", color="grey-7")
-                    ui.badge(f"Agent: {state.agent_status.value}", color="grey-7")
+                    ui.badge(f"{controller.agent_name}: {state.agent_status.value}", color="grey-7")
                     ui.label(f"Current Task: {state.current_task_name}").classes("font-medium")
     content()
     return content

@@ -140,3 +140,4 @@ class AppState:
     simulation_launch_status: str = "IDLE"
     agent_request_running: bool = False
     agent_request_cancelled: bool = False
+    welcome_shown: bool = False

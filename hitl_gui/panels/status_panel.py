@@ -26,7 +26,7 @@ def create_status_panel(controller):
                     ui.label(f"RViz Process: {state.rviz_process_status}")
                 ui.label(f"Simulation launcher: {state.simulation_launch_status}").classes("text-grey")
                 with ui.grid(columns=1).classes("w-full gap-2"):
-                    for name, status in [("Agent", state.agent_status), *state.hardware_status.items()]:
+                    for name, status in [(controller.agent_name, state.agent_status), *state.hardware_status.items()]:
                         with ui.card().classes("w-full p-2"):
                             with ui.row().classes("w-full items-center justify-between"):
                                 ui.label(name).classes("font-medium")

@@ -5,6 +5,7 @@ mode: "SIMULATION"
 ros_status: "MOCK"
 gui_mode: "MOCK"  # MOCK keeps the demo independent; set ROS to start monitoring.
 agent_bridge:
+  display_name: "Milo"
   mode: "existing_openai"  # existing_scripted, existing_openai, or mock
   timeout_sec: 15
   execution_mode: "plan_only"

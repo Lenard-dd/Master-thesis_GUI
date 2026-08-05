@@ -9,6 +9,22 @@ def test_existing_agent_success_returns_structured_tool_event():
     assert response.tool_events[0].tool_name == "safe_pick_object"
 
 
+def test_capability_question_returns_registered_skill_summary_without_a_task():
+    response = ExistingAgentBridge("existing_openai").submit("What can you do?")
+    assert response.tool_events == []
+    assert "supervised pick" in response.message
+    assert "plan-only" in response.message
+
+
+def test_welcome_message_is_added_only_once():
+    controller = GuiController()
+    controller.add_welcome_message()
+    controller.add_welcome_message()
+    messages = [entry for entry in controller.state.conversation if entry.name == controller.agent_name]
+    assert len(messages) == 1
+    assert "work" in messages[0].text.lower() or "task" in messages[0].text.lower()
+
+
 def test_tool_failure_and_retry_are_preserved_in_history():
     controller = GuiController()
     controller.add_agent_tool_event(AgentToolEvent("plan-1", None, "plan_motion", "Plan Motion Attempt 1", "failed", error_message="blocked"))

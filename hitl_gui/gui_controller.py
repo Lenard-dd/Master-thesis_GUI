@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -33,6 +34,12 @@ FLOW = [
     "generate_grasp_candidates", "validate_grasp", "plan_motion",
     "trajectory_review", "execute_motion", "verify_grasp",
 ]
+
+WELCOME_MESSAGES = (
+    "Hello, I am {agent_name}, your robot-task assistant. What would you like us to work on together today? You can also ask me what I can currently do.",
+    "Welcome back. I am {agent_name}, ready to help turn a robot task into a reviewed plan. What should we work on today? Ask about my current capabilities at any time.",
+    "Hi, I am {agent_name}. It is good to work with you. Tell me the robot task you have in mind, or ask ‘what can you do?’ to see the currently supported basics.",
+)
 
 TASK_STATUS_BY_TOOL = {
     "understand_instruction": TaskStatus.UNDERSTANDING_TASK,
@@ -65,6 +72,7 @@ class GuiController:
         self.runner = MockTaskRunner(self, step_delay=step_delay)
         self.session_logger = SessionLogger(log_root)
         self.gui_config = load_gui_config()
+        self.agent_name = self.gui_config.get("agent_bridge", {}).get("display_name", "Milo")
         rviz_settings = self.gui_config.get("rviz", {})
         self.rviz_manager = RvizProcessManager(
             rviz_settings.get("config_path", ""),
@@ -78,6 +86,7 @@ class GuiController:
     def build_page(self) -> None:
         ui.colors(primary="#1d4f91", secondary="#546e7a", accent="#1976d2")
         ui.add_head_html("<style>body { background: #f5f7fa; }</style>")
+        self.add_welcome_message()
         with ui.column().classes("w-full min-h-screen gap-4 p-4"):
             header_renderer = create_header_panel(self)
             renderers = []
@@ -112,10 +121,16 @@ class GuiController:
             renderer.refresh()
 
     def start_task(self, task_name: str) -> str | None:
+        task_name = task_name.strip()
+        if not task_name:
+            return None
+        if ExistingAgentBridge.is_capability_question(task_name):
+            self.add_chat_message(task_name, sent=True, name="Operator")
+            self.add_chat_message(ExistingAgentBridge.capabilities_message(), sent=False, name=self.agent_name)
+            return "capabilities-query"
         if self.gui_config.get("agent_bridge", {}).get("mode", "mock") != "mock":
             return self._start_agent_task(task_name)
-        task_name = task_name.strip()
-        if not task_name or self.state.task_status not in {TaskStatus.IDLE, TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
+        if self.state.task_status not in {TaskStatus.IDLE, TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
             return None
         self.reset_task(clear_conversation=False)
         self.state.event_log.clear()
@@ -126,11 +141,19 @@ class GuiController:
         self.state.agent_status = SystemComponentStatus.RUNNING
         self.append_event("task_created", new_value=task_name)
         self.add_chat_message(task_name, sent=True, name="Operator")
-        self.add_chat_message("Agent has received the task. Starting mock workflow.", sent=False, name="Agent")
+        self.add_chat_message(f"{self.agent_name} has received the task. Starting mock workflow.", sent=False, name=self.agent_name)
         self.initialize_tool_tree()
         self.append_event("task_started", new_value=task_name)
         self.runner.start(task_id)
         return task_id
+
+    def add_welcome_message(self) -> None:
+        """Show one friendly, varied greeting per GUI server session."""
+        if self.state.welcome_shown:
+            return
+        self.state.welcome_shown = True
+        welcome = random.SystemRandom().choice(WELCOME_MESSAGES).format(agent_name=self.agent_name)
+        self.add_chat_message(welcome, sent=False, name=self.agent_name)
 
     def _start_agent_task(self, task_name: str) -> str | None:
         task_name = task_name.strip()
@@ -164,7 +187,7 @@ class GuiController:
             )
             if self.state.agent_request_cancelled or self.state.current_task_id != task_id:
                 return
-            self.add_chat_message(response.message, sent=False, name="Agent")
+            self.add_chat_message(response.message, sent=False, name=self.agent_name)
             for event in response.tool_events:
                 self.add_agent_tool_event(event)
         except asyncio.TimeoutError:
@@ -404,7 +427,7 @@ class GuiController:
         for node in self.state.tool_nodes:
             if node.status in {ToolStatus.PENDING, ToolStatus.RUNNING, ToolStatus.WAITING_APPROVAL}:
                 self.update_tool_status(node.node_id, ToolStatus.CANCELLED)
-        self.add_chat_message("Task cancelled by user.", sent=False, name="Agent")
+        self.add_chat_message("Task cancelled by user.", sent=False, name=self.agent_name)
         self.append_event("task_cancelled")
         self.runner.cancel()
 
@@ -417,7 +440,7 @@ class GuiController:
                 self.update_tool_status(node.node_id, ToolStatus.CANCELLED)
         self.state.task_status = TaskStatus.CANCELLED
         self.state.agent_status = SystemComponentStatus.IDLE
-        self.add_chat_message("Task was rejected by the user.", sent=False, name="Agent")
+        self.add_chat_message("Task was rejected by the user.", sent=False, name=self.agent_name)
         self.append_event("task_cancelled", metadata={"reason": "hitl_rejected"})
 
     def replan_task(self) -> None:
@@ -451,7 +474,7 @@ class GuiController:
     def complete_task(self) -> None:
         self.state.task_status = TaskStatus.COMPLETED
         self.state.agent_status = SystemComponentStatus.IDLE
-        self.add_chat_message("Task completed successfully in mock simulation.", sent=False, name="Agent")
+        self.add_chat_message("Task completed successfully in mock simulation.", sent=False, name=self.agent_name)
         self.append_event("task_completed")
 
     def complete_active_trajectory_review(self) -> None:

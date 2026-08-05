@@ -35,6 +35,8 @@ class ExistingAgentBridge:
         self.mode = mode
 
     def submit(self, instruction: str, execution_mode: str = "plan_only") -> AgentResponse:
+        if self.is_capability_question(instruction):
+            return AgentResponse(self.capabilities_message())
         try:
             from llm_skill_robot.agent.agent_controller import AgentController, AgentDecisionKind
             from llm_skill_robot.agent.agent_state import AgentState
@@ -74,3 +76,44 @@ class ExistingAgentBridge:
                 approval_stages=approval_stages,
             )])
         return AgentResponse(decision.message)
+
+    @staticmethod
+    def is_capability_question(instruction: str) -> bool:
+        text = instruction.lower().strip()
+        phrases = (
+            "what can you do", "what tasks", "your capabilities", "supported tasks",
+            "你能做什么", "能做什么", "可以做什么", "支持什么", "有哪些功能", "可以完成什么",
+        )
+        return any(phrase in text for phrase in phrases)
+
+    @staticmethod
+    def capabilities_message() -> str:
+        """Describe current registered capabilities without contacting an LLM."""
+        try:
+            from llm_skill_robot.agent.composite_skills.registry import CompositeSkillRegistry
+            from llm_skill_robot.agent.tool_registry import AgentToolRegistry
+
+            tools = {tool.name for tool in AgentToolRegistry().list_tools()}
+            composites = {item["skill_name"] for item in CompositeSkillRegistry().list_skills()}
+        except Exception:
+            tools = set()
+            composites = set()
+
+        items = []
+        if "detect_object" in tools:
+            items.append("observe or detect a specified object")
+        if "safe_pick_object" in composites:
+            items.append("propose a supervised pick for a clearly specified object")
+        if "move_to_named_target" in tools:
+            items.append("plan movement to the named targets home, safe_home, or observe")
+        if "place_object" in tools:
+            items.append("propose placing an object that is already held")
+        if {"open_gripper", "close_gripper", "get_gripper_state"} & tools:
+            items.append("check or propose approved gripper operations")
+
+        capability_list = "; ".join(items) if items else "inspect the currently registered robot skills"
+        return (
+            f"I can currently help you {capability_list}. "
+            "I will ask for clarification when the target or task is ambiguous, and I will stop at the required human review points. "
+            "This GUI is still plan-only, so no robot motion is executed from this chat."
+        )
