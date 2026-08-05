@@ -85,6 +85,7 @@ class ToolNode:
     editable_fields: list[str] = field(default_factory=list)
     plan_version: int = 1
     modified_by_user: bool = False
+    dependencies: list[str] = field(default_factory=list)
     input_summary: dict[str, Any] = field(default_factory=dict)
     output_summary: dict[str, Any] = field(default_factory=dict)
 
@@ -109,6 +110,25 @@ class HitlRequest:
     planning_time: int | None = None
     collision_check: str = "UNKNOWN"
     target_summary: str = ""
+    object_id: str | None = None
+    candidate_objects: list[dict[str, Any]] = field(default_factory=list)
+    grasp_candidates: list[dict[str, Any]] = field(default_factory=list)
+    selected_index: int = 0
+    recovery_actions: list[str] = field(default_factory=list)
+    error_type: str | None = None
+
+
+@dataclass
+class TaskExperimentMetrics:
+    task_started_at: str | None = None
+    task_finished_at: str | None = None
+    total_task_time_ms: int | None = None
+    human_wait_started_at: str | None = None
+    human_wait_time_ms: int = 0
+    replan_count: int = 0
+    tool_failure_count: int = 0
+    target_change_count: int = 0
+    grasp_change_count: int = 0
 
 
 @dataclass
@@ -141,6 +161,9 @@ class AppState:
     hardware_status: dict[str, SystemComponentStatus] = field(default_factory=dict)
     pending_hitl_request: HitlRequest | None = None
     current_trajectory_id: str | None = None
+    current_target_id: str | None = None
+    current_grasp_candidate_id: str | None = None
+    experiment_metrics: TaskExperimentMetrics = field(default_factory=TaskExperimentMetrics)
     event_log: list[ExecutionEvent] = field(default_factory=list)
     modification_history: list[ExecutionEvent] = field(default_factory=list)
     rviz_running: bool = False

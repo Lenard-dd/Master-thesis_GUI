@@ -90,11 +90,14 @@ def test_safe_pick_completes_the_full_mock_tree_through_each_hitl_gate():
             "detect_object", "build_object_point_cloud", "generate_grasp_pose", "review_grasp_candidate",
         ]
         review = controller.state.pending_hitl_request
-        assert review is not None and review.request_type == "grasp_candidate"
-        assert controller.submit_hitl_decision(review.request_id, HitlDecision.APPROVE)
+        assert review is not None and review.request_type == "grasp_review"
+        assert controller.approve_grasp_candidate(review.request_id)
         # Open gripper uses its own D gate; pregrasp, approach, and retreat
         # each use an independent C trajectory gate.
-        for expected in ("execution", "trajectory_review", "trajectory_review", "execution", "trajectory_review"):
+        for expected in (
+            "execution", "trajectory_review", "trajectory_review", "execution",
+            "trajectory_review", "trajectory_review", "execution",
+        ):
             pending = controller.state.pending_hitl_request
             assert pending is not None and pending.request_type == expected
             assert controller.submit_hitl_decision(pending.request_id, HitlDecision.APPROVE)
@@ -110,8 +113,10 @@ def test_safe_pick_completes_the_full_mock_tree_through_each_hitl_gate():
             "review_grasp_candidate", "open_gripper", "move_to_pregrasp",
             "trajectory_review", "approach_grasp", "trajectory_review",
             "close_gripper", "retreat_grasp", "trajectory_review", "verify_grasp",
+            "move_to_named_target", "trajectory_review", "open_gripper",
         ]
         assert [call["planner_id"] for call in adapter.backend.pose_calls] == ["PTP", "LIN", "LIN"]
         assert all(call["pipeline_id"] == "pilz_industrial_motion_planner" for call in adapter.backend.pose_calls)
+        assert [record.summary.get("target_name") for record in adapter.records.values() if record.summary.get("target_name")] == ["observe", "home"]
 
     asyncio.run(scenario())

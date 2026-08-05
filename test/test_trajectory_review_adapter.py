@@ -97,15 +97,13 @@ def test_reject_never_executes_trajectory():
     asyncio.run(scenario())
 
 
-def test_real_mode_requires_the_second_execution_confirmation():
+def test_phase9_real_mode_is_disabled_before_trajectory_review():
     async def scenario():
         controller, backend = _controller_with_adapter()
         controller.state.robot_mode = "REAL ROBOT"
         plan_task = controller.request_named_target_trajectory("home")
-        request = await _wait_for_request(controller)
         await plan_task
-        assert not controller.submit_hitl_decision(request.request_id, HitlDecision.APPROVE)
-        assert controller.submit_hitl_decision(request.request_id, HitlDecision.APPROVE, real_confirmed=True)
-        await controller._last_execution_task
-        assert backend.executed == [request.trajectory_id]
+        assert controller.state.pending_hitl_request is None
+        assert controller.state.task_status == TaskStatus.FAILED
+        assert backend.executed == []
     asyncio.run(scenario())

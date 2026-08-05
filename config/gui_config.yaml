@@ -19,6 +19,16 @@ runtime_backends:
   mock_perception:
     object_id: "mock_red_cube_1"
     confidence: 0.99
+phase9:
+  # The complete closed loop is intentionally enabled for fake hardware only.
+  simulation_only: true
+  place_named_target: "home"
+  mock_verification_success: true
+  target_review:
+    always_when_multiple: true
+    ambiguity_margin: 0.10
+  grasp_review:
+    require_review: true
 ros_monitor:
   refresh_hz: 5
   ready_age_sec: 1.0

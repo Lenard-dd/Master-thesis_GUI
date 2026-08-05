@@ -34,6 +34,7 @@ TOOL_PHASE = {
     "close_gripper": "execution",
     "execute_motion": "execution",
     "verify_grasp": "verification",
+    "error_recovery": "hitl_review",
 }
 
 
@@ -91,16 +92,22 @@ class TaskPlanAdapter:
     def from_tool_node(self, node: Any, *, sequence_index: int) -> TaskNode:
         tool_name = str(getattr(node, "tool_name", "") or "unknown_tool")
         status = getattr(node, "status", "PENDING")
+        input_data = dict(getattr(node, "input_data", {}) or {})
+        input_data.update(dict(getattr(node, "input_summary", {}) or {}))
+        output_data = dict(getattr(node, "output_data", {}) or {})
+        output_data.update(dict(getattr(node, "output_summary", {}) or {}))
         return TaskNode(
             node_id=str(node.node_id), parent_id=node.parent_id,
             display_name=str(node.display_name), description="",
-            node_type="hitl" if tool_name == "trajectory_review" else (
+            node_type="hitl" if bool(node.requires_approval) else (
                 "composite" if tool_name.endswith("_object") and node.parent_id is None else "tool"
             ),
             phase=phase_for_tool(tool_name), sequence_index=sequence_index,
             status=getattr(status, "value", str(status)), tool_name=tool_name,
-            dependencies=[node.parent_id] if node.parent_id else [],
-            input_data=dict(node.input_data), output_data=dict(node.output_data),
+            # parent_id describes containment; dependencies describe execution
+            # order. They must not be inferred from one another.
+            dependencies=list(getattr(node, "dependencies", []) or []),
+            input_data=input_data, output_data=output_data,
             error_message=node.error_message,
             requires_approval=bool(node.requires_approval), editable=bool(node.editable),
             editable_fields=list(node.editable_fields), plan_version=int(node.plan_version),

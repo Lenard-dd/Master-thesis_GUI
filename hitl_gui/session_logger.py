@@ -34,11 +34,15 @@ class SessionLogger:
             "task_status": state.task_status,
             "plan_version": state.current_plan_version,
             "trajectory_id": state.current_trajectory_id,
+            "target_id": state.current_target_id,
+            "grasp_candidate_id": state.current_grasp_candidate_id,
             "robot_mode": state.robot_mode,
+            "experiment_metrics": state.experiment_metrics,
         })
         self._write(task_dir / "execution_events.json", state.event_log)
         self._write(task_dir / "conversation.json", state.conversation)
         self._write(task_dir / "tool_receipts.json", [self._receipt(node) for node in state.tool_nodes])
+        self._write(task_dir / "experiment_metrics.json", state.experiment_metrics)
         return task_dir
 
     @staticmethod

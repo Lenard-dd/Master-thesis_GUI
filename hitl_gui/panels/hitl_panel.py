@@ -30,6 +30,37 @@ def create_hitl_panel(controller):
                     ui.label(
                         f"{request.trajectory_points} points · duration {duration} · planning {planning} · {controller.state.robot_mode}"
                     ).classes("text-xs text-grey")
+                elif request.request_type == "target_review":
+                    selected = next((item for item in request.candidate_objects
+                                     if str(item.get("object_id")) == str(request.object_id)), {})
+                    ui.label(f"Selected: {selected.get('label', '-')} · {request.object_id or '-'}").classes("text-sm font-medium")
+                    confidence = selected.get("confidence")
+                    ui.label(f"Confidence: {confidence if confidence is not None else '-'} · Position: {selected.get('position_summary', selected.get('position', '-'))}").classes("text-xs text-grey")
+                    ui.label(f"{len(request.candidate_objects)} candidate object(s)").classes("text-xs")
+                    with ui.expansion("Candidate objects", icon="view_list").classes("w-full text-xs"):
+                        for item in request.candidate_objects:
+                            marker = "→" if str(item.get("object_id")) == str(request.object_id) else "·"
+                            ui.label(
+                                f"{marker} {item.get('label', 'object')} · {item.get('object_id', '-')} · confidence {item.get('confidence', '-')}"
+                            ).classes("text-xs")
+                elif request.request_type == "grasp_review":
+                    candidate = request.grasp_candidates[request.selected_index] if request.grasp_candidates else {}
+                    scores = [item.get("score") for item in request.grasp_candidates if item.get("score") is not None]
+                    ui.label(
+                        f"{len(request.grasp_candidates)} valid candidate(s) · best score {max(scores) if scores else '-'}"
+                    ).classes("text-xs text-grey")
+                    ui.label(f"Candidate: {request.grasp_candidate_id or '-'} · rank {candidate.get('rank', request.selected_index + 1)}").classes("text-sm font-medium")
+                    ui.label(
+                        f"score {candidate.get('score', '-')} · IK {candidate.get('ik_result', 'UNKNOWN')} · "
+                        f"collision {candidate.get('collision_result', 'UNKNOWN')}"
+                    ).classes("text-xs")
+                    ui.label(
+                        f"approach {candidate.get('approach_distance', '-')} · joint margin {candidate.get('joint_margin', '-')} · "
+                        f"orientation change {candidate.get('orientation_change', '-')}"
+                    ).classes("text-xs text-grey")
+                elif request.request_type == "error_recovery":
+                    ui.badge(request.error_type or "error", color="negative")
+                    ui.label(request.description).classes("text-sm text-grey")
                 else:
                     ui.label(request.description).classes("text-sm text-grey")
 
@@ -45,23 +76,43 @@ def create_hitl_panel(controller):
             ui.button("Stop RViz", on_click=controller.stop_rviz).props("dense outline")
             ui.button("Preview", on_click=controller.preview_current_trajectory).props("dense outline")
 
-            def submit(decision: HitlDecision) -> None:
-                request = controller.state.pending_hitl_request
-                if request is not None:
-                    controller.submit_hitl_decision(request.request_id, decision)
+        @ui.refreshable
+        def action_view():
+            request = controller.state.pending_hitl_request
+            if request is None:
+                return
+            with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
+                if request.request_type == "target_review":
+                    ui.button("Confirm", color="positive", on_click=lambda: controller.skill_runtime.select_target(
+                        request.request_id, str(request.object_id))).props("dense")
+                    ui.button("Select Another", on_click=lambda: controller.skill_runtime.select_next_target(request.request_id)).props("dense outline")
+                    ui.button("Reject Task", color="negative", on_click=controller.cancel_task).props("dense outline")
+                elif request.request_type == "grasp_review":
+                    ui.button("Approve Grasp", color="positive", on_click=lambda: controller.approve_grasp_candidate(request.request_id)).props("dense")
+                    ui.button("Next Candidate", on_click=lambda: controller.skill_runtime.select_next_grasp(request.request_id)).props("dense outline")
+                    ui.button("Reject", color="negative", on_click=controller.cancel_task).props("dense outline")
+                    ui.button("Regenerate", on_click=lambda: controller.skill_runtime.regenerate_grasps(request.request_id)).props("dense outline")
+                elif request.request_type == "error_recovery":
+                    for action in request.recovery_actions:
+                        ui.button(action, color="negative" if action == "Cancel" else "primary",
+                                  on_click=lambda selected=action: controller.skill_runtime.handle_recovery(
+                                      request.request_id, selected)).props("dense outline" if action != "Retry" else "dense")
+                else:
+                    def submit(decision: HitlDecision) -> None:
+                        current = controller.state.pending_hitl_request
+                        if current is not None:
+                            controller.submit_hitl_decision(current.request_id, decision)
+                    ui.button("Approve", color="positive", on_click=lambda: _approve(controller, submit)).props("dense")
+                    ui.button("Reject", color="negative", on_click=lambda: submit(HitlDecision.REJECT)).props("dense")
+                    if request.request_type == "trajectory_review":
+                        ui.button("Replan", color="primary", on_click=lambda: _replan_dialog(controller)).props("dense")
+                    ui.button("Cancel", on_click=controller.cancel_task).props("dense outline")
 
-            approve_button = ui.button("Approve", color="positive", on_click=lambda: _approve(controller, submit)).props("dense")
-            reject_button = ui.button("Reject", color="negative", on_click=lambda: submit(HitlDecision.REJECT)).props("dense")
-            replan_button = ui.button("Replan", color="primary", on_click=lambda: _replan_dialog(controller)).props("dense")
-            ui.button("Cancel", on_click=controller.cancel_task).props("dense outline")
+        action_view()
 
     def refresh() -> None:
         request_view.refresh()
-        request = controller.state.pending_hitl_request
-        enabled = request is not None
-        approve_button.set_enabled(enabled)
-        reject_button.set_enabled(enabled)
-        replan_button.set_enabled(enabled and request.request_type == "trajectory_review")
+        action_view.refresh()
 
     refresh()
     return refresh

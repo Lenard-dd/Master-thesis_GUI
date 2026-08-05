@@ -12,7 +12,7 @@ import yaml
 
 from hitl_gui.app_state import (
     AppState, ChatEntry, ExecutionEvent, HitlDecision, HitlRequest,
-    SystemComponentStatus, TaskStatus, ToolNode, ToolStatus, utc_now,
+    SystemComponentStatus, TaskExperimentMetrics, TaskStatus, ToolNode, ToolStatus, utc_now,
 )
 from hitl_gui.mock.mock_task_runner import MockTaskRunner
 from hitl_gui.session_logger import SessionLogger
@@ -158,6 +158,7 @@ class GuiController:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         self.state.current_task_id = task_id
         self.state.current_task_name = task_name
+        self.state.experiment_metrics = TaskExperimentMetrics(task_started_at=utc_now())
         self.initialize_task_plan(task_id, task_name)
         self.state.task_status = TaskStatus.UNDERSTANDING_TASK
         self.state.agent_status = SystemComponentStatus.RUNNING
@@ -186,6 +187,7 @@ class GuiController:
         task_id = f"task-{uuid.uuid4().hex[:8]}"
         self.state.current_task_id = task_id
         self.state.current_task_name = task_name
+        self.state.experiment_metrics = TaskExperimentMetrics(task_started_at=utc_now())
         self.initialize_task_plan(task_id, task_name)
         self.state.agent_status = SystemComponentStatus.RUNNING
         self.state.agent_request_running = True
@@ -239,6 +241,7 @@ class GuiController:
             input_data=event.input_json, output_data=event.output_json,
             input_summary=event.input_json, output_summary=event.output_json,
             error_message=event.error_message, requires_approval=event.requires_approval,
+            dependencies=list(getattr(event, "dependencies", []) or []),
             plan_version=self.state.current_plan_version,
         )
         self.register_tool_node(node, description=getattr(event, "description", ""))
@@ -306,20 +309,34 @@ class GuiController:
             self.state.current_task_plan.version = int(version)
             self.state.current_task_plan.touch()
 
+    def select_task_node(self, node_id: str | None):
+        """Select a TaskPlan node through the controller mutation boundary."""
+        plan = self.state.current_task_plan
+        if node_id is None:
+            self.state.selected_task_node_id = None
+            return None
+        if plan is None or node_id not in plan.nodes:
+            return None
+        self.state.selected_task_node_id = node_id
+        return plan.nodes[node_id]
+
     def clear_conversation(self) -> None:
         self.state.conversation.clear()
         self.append_event("chat_cleared")
 
     def initialize_tool_tree(self) -> None:
-        self.state.tool_nodes = [
-            ToolNode(
+        self.state.tool_nodes = []
+        previous_id = None
+        for name in FLOW:
+            node = ToolNode(
                 node_id=name, parent_id=None, tool_name=name,
                 display_name=name.replace("_", " ").title(),
                 requires_approval=name == "trajectory_review",
                 editable=False, plan_version=self.state.current_plan_version,
+                dependencies=[previous_id] if previous_id else [],
             )
-            for name in FLOW
-        ]
+            self.state.tool_nodes.append(node)
+            previous_id = name
         for node in self.state.tool_nodes:
             self.register_tool_node(node, append_legacy=False)
         self.append_event("tool_tree_initialized")
@@ -336,6 +353,8 @@ class GuiController:
         if status in {ToolStatus.SUCCEEDED, ToolStatus.FAILED, ToolStatus.REJECTED, ToolStatus.CANCELLED, ToolStatus.INVALIDATED}:
             node.end_time = utc_now()
             node.duration_ms = self._duration_ms(node.start_time, node.end_time)
+        if status == ToolStatus.FAILED and old_status != ToolStatus.FAILED:
+            self.state.experiment_metrics.tool_failure_count += 1
         output_summary = output.pop("output_summary", {})
         input_summary = output.pop("input_summary", {})
         error_message = output.pop("error_message", None)
@@ -359,10 +378,12 @@ class GuiController:
                       "error_message": node.error_message},
         )
         if self.state.current_task_plan is not None:
+            structured_input = {**node.input_data, **node.input_summary}
+            structured_output = {**node.output_data, **node.output_summary}
             self.plan_event_converter.apply_status(
                 self.state.current_task_plan, self.state.node_attempts,
-                node_id, status.value, input_data=node.input_data,
-                output_data=node.output_data, error_message=node.error_message,
+                node_id, status.value, input_data=structured_input,
+                output_data=structured_output, error_message=node.error_message,
                 trajectory_id=node.output_data.get("trajectory_id"),
             )
         return True
@@ -387,15 +408,149 @@ class GuiController:
             plan_version=self.state.current_plan_version,
         )
         self.state.pending_hitl_request = request
+        self.state.experiment_metrics.human_wait_started_at = request.created_at
         self.append_event("hitl_requested", node_id="trajectory_review", new_value=request.request_id,
                           metadata={"request_id": request.request_id, "trajectory_id": request.trajectory_id})
         return request
+
+    def create_target_review_request(self, node: ToolNode, objects: list[dict[str, Any]]) -> HitlRequest:
+        request = HitlRequest(
+            request_id=f"target-review-{uuid.uuid4().hex[:8]}",
+            task_id=self.state.current_task_id or "", request_type="target_review",
+            target_id=node.node_id, title="Confirm detected target",
+            description="The perception result is ambiguous. Confirm the intended object.",
+            options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.CANCEL],
+            created_at=utc_now(), trajectory_id=None, grasp_candidate_id=None,
+            plan_version=self.state.current_plan_version,
+            object_id=str(objects[0].get("object_id")) if objects else None,
+            candidate_objects=[dict(item) for item in objects],
+        )
+        self.register_tool_node(node, append_legacy=False)
+        self._set_pending_hitl(request)
+        return request
+
+    def create_grasp_review_request(self, node: ToolNode, candidates: list[dict[str, Any]]) -> HitlRequest:
+        candidate_id = None
+        if candidates:
+            candidate_id = candidates[0].get("grasp_candidate_id") or candidates[0].get("candidate_id") or candidates[0].get("id")
+        request = HitlRequest(
+            request_id=f"grasp-review-{uuid.uuid4().hex[:8]}",
+            task_id=self.state.current_task_id or "", request_type="grasp_review",
+            target_id=node.node_id, title="Confirm grasp candidate",
+            description="Review the ranked candidate before MoveIt motion planning.",
+            options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.REPLAN, HitlDecision.CANCEL],
+            created_at=utc_now(), trajectory_id=None,
+            grasp_candidate_id=str(candidate_id) if candidate_id is not None else None,
+            plan_version=self.state.current_plan_version,
+            object_id=self.state.current_target_id,
+            grasp_candidates=[dict(item) for item in candidates],
+        )
+        self.register_tool_node(node, append_legacy=False)
+        self._set_pending_hitl(request)
+        return request
+
+    def create_recovery_request(self, node: ToolNode, error_type: str, description: str,
+                                actions: list[str]) -> HitlRequest:
+        request = HitlRequest(
+            request_id=f"recovery-{uuid.uuid4().hex[:8]}",
+            task_id=self.state.current_task_id or "", request_type="error_recovery",
+            target_id=node.node_id, title=error_type.replace("_", " ").title(),
+            description=description, options=[HitlDecision.CANCEL], created_at=utc_now(),
+            trajectory_id=self.state.current_trajectory_id,
+            grasp_candidate_id=self.state.current_grasp_candidate_id,
+            plan_version=self.state.current_plan_version,
+            object_id=self.state.current_target_id, recovery_actions=list(actions),
+            error_type=error_type,
+        )
+        self.register_tool_node(node, append_legacy=False)
+        self._set_pending_hitl(request)
+        self.append_event(error_type, node_id=node.node_id, metadata={"recovery_actions": actions})
+        return request
+
+    def _set_pending_hitl(self, request: HitlRequest) -> None:
+        self.state.pending_hitl_request = request
+        self.state.experiment_metrics.human_wait_started_at = request.created_at
+        self.append_event("hitl_requested", node_id=request.target_id, new_value=request.request_id,
+                          metadata={"request_id": request.request_id, "request_type": request.request_type})
+
+    def resolve_special_hitl(self, request: HitlRequest, event_type: str, **metadata: Any) -> None:
+        if self.state.pending_hitl_request is not request:
+            return
+        request.status = "RESOLVED"
+        self._finish_human_wait()
+        self.state.pending_hitl_request = None
+        node = self._node(request.target_id)
+        if node:
+            node.status = ToolStatus.SUCCEEDED
+            node.output_summary.update(metadata)
+            self.register_tool_node(node, append_legacy=False)
+        self.append_event(event_type, node_id=request.target_id,
+                          metadata={"request_id": request.request_id, **metadata})
+
+    def approve_grasp_candidate(self, request_id: str) -> bool:
+        request = self.state.pending_hitl_request
+        if not request or request.request_id != request_id or request.request_type != "grasp_review":
+            return False
+        candidate_id = request.grasp_candidate_id
+        if not candidate_id or candidate_id != self.state.current_grasp_candidate_id:
+            return False
+        node = self._node(request.target_id)
+        self.resolve_special_hitl(request, "grasp_candidate_approved", grasp_candidate_id=candidate_id)
+        if node:
+            self.skill_runtime.continue_after_grasp_review(node)
+        return True
+
+    def invalidate_lineage(self, reason: str) -> None:
+        old_target = self.state.current_target_id
+        old_grasp = self.state.current_grasp_candidate_id
+        old_trajectory = self.state.current_trajectory_id
+        invalidated_trajectories: list[str] = []
+        if self.trajectory_adapter:
+            for trajectory_id, record in self.trajectory_adapter.records.items():
+                record_target = record.planning_request.get("target_id")
+                record_grasp = record.planning_request.get("grasp_candidate_id")
+                is_downstream = (
+                    reason == "target_changed" and old_target is not None and record_target == old_target
+                ) or (
+                    reason != "target_changed" and old_grasp is not None and record_grasp == old_grasp
+                )
+                if is_downstream and not record.invalidated:
+                    self._invalidated_trajectory_ids.add(trajectory_id)
+                    record.invalidated = True
+                    invalidated_trajectories.append(trajectory_id)
+        for node in list(self.state.tool_nodes):
+            node_target = node.input_data.get("target_id")
+            node_grasp = node.input_data.get("grasp_candidate_id")
+            is_downstream = (
+                reason == "target_changed" and old_target is not None and node_target == old_target
+            ) or (
+                reason != "target_changed" and old_grasp is not None and node_grasp == old_grasp
+            )
+            if is_downstream and node.status not in {ToolStatus.INVALIDATED, ToolStatus.CANCELLED}:
+                self.update_tool_status(node.node_id, ToolStatus.INVALIDATED,
+                                        output_summary={"invalidation_reason": reason})
+        self.state.current_grasp_candidate_id = None
+        self.state.current_trajectory_id = None
+        old_version = self.state.current_plan_version
+        self.set_plan_version(old_version + 1)
+        if reason == "target_changed":
+            self.state.experiment_metrics.target_change_count += 1
+        self.append_event("downstream_results_invalidated", metadata={
+            "reason": reason, "old_target_id": old_target,
+            "old_grasp_candidate_id": old_grasp,
+            "invalidated_trajectory_ids": invalidated_trajectories,
+        })
+        self.append_event("plan_version_changed", old_value=old_version,
+                          new_value=self.state.current_plan_version, metadata={"reason": reason})
 
     def set_trajectory_adapter(self, adapter: ExistingTrajectoryReviewAdapter) -> None:
         """Inject the existing MoveIt-backed adapter (also used by unit tests)."""
         self.trajectory_adapter = adapter
 
     def _ensure_trajectory_adapter(self) -> ExistingTrajectoryReviewAdapter:
+        if (self.gui_config.get("phase9", {}).get("simulation_only", True)
+                and self.state.robot_mode in {"REAL", "REAL ROBOT"}):
+            raise RuntimeError("Phase 9 trajectory planning/execution is restricted to SIMULATION.")
         if self.trajectory_adapter is not None:
             return self.trajectory_adapter
         if self.ros_worker is None:
@@ -466,8 +621,25 @@ class GuiController:
                 record = adapter.plan_named_target(target, self.state.current_plan_version)
         except Exception as exc:
             self.state.task_status = TaskStatus.FAILED
+            if source_node_id:
+                self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=str(exc))
             self.append_event("tool_failed", node_id=source_node_id, metadata={"reason": str(exc), "target": target})
             self.add_chat_message(f"MoveIt planning failed: {exc}", sent=False, name="System")
+            if self.state.current_task_id:
+                self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", str(exc), ["Retry", "Replan", "Cancel"])
+            return
+        if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
+            reason = "MoveIt returned no executable trajectory or validation blocked it."
+            if source_node_id:
+                self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=reason,
+                                        output_summary={"planning_result": record.summary,
+                                                        "validation": record.validation_result})
+            self.append_event("planning_failed", node_id=source_node_id,
+                              metadata={"reason": reason, "target": target,
+                                        "planning_result": record.summary,
+                                        "validation": record.validation_result})
+            if self.state.current_task_id:
+                self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", reason, ["Retry", "Replan", "Cancel"])
             return
         self._create_trajectory_review_request(record, source_node_id)
         # Publishing one DisplayTrajectory is non-blocking; keeping it on this
@@ -505,6 +677,21 @@ class GuiController:
             self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=str(exc)) if source_node_id else None
             self.append_event("tool_failed", node_id=source_node_id, metadata={"reason": str(exc), "skill_id": skill_id})
             self.add_chat_message(f"MoveIt pose planning failed: {exc}", sent=False, name="System")
+            if self.state.current_task_id:
+                self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", str(exc), ["Retry", "Select Another Grasp", "Replan", "Cancel"])
+            return
+        if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
+            reason = "MoveIt returned no executable pose trajectory or validation blocked it."
+            if source_node_id:
+                self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=reason,
+                                        output_summary={"planning_result": record.summary,
+                                                        "validation": record.validation_result})
+            self.append_event("planning_failed", node_id=source_node_id,
+                              metadata={"reason": reason, "skill_id": skill_id,
+                                        "planning_result": record.summary,
+                                        "validation": record.validation_result})
+            if self.state.current_task_id:
+                self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", reason, ["Retry", "Select Another Grasp", "Replan", "Cancel"])
             return
         self._create_trajectory_review_request(record, source_node_id)
         preview = adapter.preview(record.trajectory_id)
@@ -514,6 +701,9 @@ class GuiController:
     def _create_trajectory_review_request(self, record, source_node_id: str | None) -> HitlRequest:
         summary = record.summary
         trajectory_id = record.trajectory_id
+        record.planning_request["task_id"] = self.state.current_task_id
+        record.planning_request["target_id"] = self.state.current_target_id
+        record.planning_request["grasp_candidate_id"] = self.state.current_grasp_candidate_id
         self.state.current_trajectory_id = trajectory_id
         # A Safe Pick contains several motion reviews under the same plan
         # version.  The trajectory ID prevents later approvals from resolving
@@ -523,7 +713,11 @@ class GuiController:
             node_id=review_node_id, parent_id=source_node_id, tool_name="trajectory_review",
             display_name=f"Trajectory Review (Attempt {record.plan_version})",
             status=ToolStatus.WAITING_APPROVAL, requires_approval=True,
+            dependencies=[source_node_id] if source_node_id else [],
             plan_version=record.plan_version,
+            input_data={"task_id": self.state.current_task_id,
+                        "target_id": self.state.current_target_id,
+                        "grasp_candidate_id": self.state.current_grasp_candidate_id},
             output_data={"trajectory_id": trajectory_id, "summary": summary,
                          "validation": record.validation_result},
             output_summary={"trajectory_id": trajectory_id,
@@ -536,14 +730,17 @@ class GuiController:
             target_id=review_node_id, title="Trajectory approval required",
             description="Review the MoveIt trajectory in RViz before it is executed.",
             options=[HitlDecision.APPROVE, HitlDecision.REJECT, HitlDecision.REPLAN, HitlDecision.CANCEL],
-            created_at=utc_now(), trajectory_id=trajectory_id, grasp_candidate_id=None,
+            created_at=utc_now(), trajectory_id=trajectory_id,
             plan_version=record.plan_version, planning_success=bool(summary.get("success")),
             trajectory_points=int(summary.get("num_trajectory_points", 0)),
             trajectory_duration=summary.get("duration_sec"), planning_time=record.planning_time_ms,
             collision_check=record.validation_result.get("decision", "UNKNOWN"),
             target_summary=record.target_summary,
+            object_id=self.state.current_target_id,
+            grasp_candidate_id=self.state.current_grasp_candidate_id,
         )
         self.state.pending_hitl_request = request
+        self.state.experiment_metrics.human_wait_started_at = request.created_at
         if self.state.current_task_plan is not None:
             self.plan_event_converter.bind_review_ids(
                 self.state.current_task_plan, self.state.node_attempts,
@@ -592,6 +789,7 @@ class GuiController:
         )
         self.register_tool_node(node, append_legacy=False)
         self.state.pending_hitl_request = request
+        self.state.experiment_metrics.human_wait_started_at = request.created_at
         if self.state.current_task_plan is not None:
             self.plan_event_converter.bind_review_ids(
                 self.state.current_task_plan, self.state.node_attempts,
@@ -613,7 +811,17 @@ class GuiController:
         if request.request_id != request_id or request.task_id != self.state.current_task_id:
             return False
         if request.request_type != "trajectory_review":
+            if request.request_type == "grasp_review":
+                if decision == HitlDecision.APPROVE:
+                    return self.approve_grasp_candidate(request_id)
+                if decision in {HitlDecision.REJECT, HitlDecision.CANCEL}:
+                    self.resolve_special_hitl(request, "hitl_rejected", user_decision=decision.value)
+                    self.cancel_task()
+                    return True
             return self._submit_agent_hitl_decision(request, decision)
+        if (self.gui_config.get("phase9", {}).get("simulation_only", True)
+                and self.state.robot_mode in {"REAL", "REAL ROBOT"}):
+            return False
         if request.plan_version != self.state.current_plan_version:
             return False
         if request.trajectory_id != self.state.current_trajectory_id:
@@ -629,6 +837,7 @@ class GuiController:
         if self.trajectory_adapter is not None and request.trajectory_id in self.trajectory_adapter.records:
             return self._submit_existing_trajectory_decision(request, decision)
         request.status = decision.value
+        self._finish_human_wait()
         review = self._active_trajectory_review()
         if review:
             review.output_summary.update({
@@ -654,6 +863,7 @@ class GuiController:
         if decision == HitlDecision.REPLAN:
             return self.replan_trajectory(request.request_id, "other")
         request.status = decision.value
+        self._finish_human_wait()
         self.state.pending_hitl_request = None
         node = self._node(request.target_id)
         if decision in {HitlDecision.REJECT, HitlDecision.CANCEL}:
@@ -696,7 +906,7 @@ class GuiController:
             return
         success = bool(result.get("success"))
         event_type = "execution_succeeded" if success else "execution_failed"
-        self.state.task_status = TaskStatus.COMPLETED if success else TaskStatus.FAILED
+        self.state.task_status = TaskStatus.EXECUTING if success else TaskStatus.FAILED
         self.append_event(event_type, node_id=request.target_id,
                           metadata={"trajectory_id": trajectory_id, "plan_version": request.plan_version,
                                     "execution_duration": result.get("execution_duration"),
@@ -707,7 +917,19 @@ class GuiController:
         if success and source_node_id:
             self.update_tool_status(source_node_id, ToolStatus.SUCCEEDED,
                                     output_summary={"trajectory_id": trajectory_id, "controller_result": result})
-            self.skill_runtime.on_motion_execution_completed(source_node_id)
+            self.skill_runtime.on_motion_execution_completed(
+                source_node_id, review_node_id=request.target_id,
+            )
+        elif not success and self.state.current_task_id:
+            if source_node_id:
+                self.update_tool_status(source_node_id, ToolStatus.FAILED,
+                                        error_message=str(result.get("message", "Trajectory execution failed")),
+                                        output_summary={"trajectory_id": trajectory_id, "controller_result": result})
+            self.skill_runtime._request_recovery(
+                self.state.current_task_id, "execution_failed",
+                str(result.get("message", "Trajectory execution failed")),
+                ["Retry", "Replan", "Cancel"],
+            )
 
     def replan_trajectory(self, request_id: str, reason: str) -> bool:
         request = self.state.pending_hitl_request
@@ -735,6 +957,7 @@ class GuiController:
             )
         old_version = self.state.current_plan_version
         self.set_plan_version(self.state.current_plan_version + 1)
+        self.state.experiment_metrics.replan_count += 1
         self.append_event("trajectory_invalidated", node_id=request.target_id,
                           metadata={"trajectory_id": trajectory_id, "request_id": request.request_id,
                                     "reason": reason})
@@ -770,6 +993,7 @@ class GuiController:
         if decision == HitlDecision.REPLAN:
             return False
         request.status = decision.value
+        self._finish_human_wait()
         node = self._node(request.target_id)
         event_type = {
             HitlDecision.APPROVE: "hitl_approved",
@@ -844,6 +1068,8 @@ class GuiController:
 
     def cancel_task(self) -> None:
         self.skill_runtime.cancel(self.state.current_task_id)
+        self._finish_human_wait()
+        self._finalize_metrics()
         if self.state.agent_request_running:
             self.state.agent_request_cancelled = True
             self.state.agent_request_running = False
@@ -906,9 +1132,11 @@ class GuiController:
         self.append_event("plan_replanned", node_id=plan_id, new_value=trajectory_id, metadata={"plan_version": attempt})
 
     def complete_task(self) -> None:
+        self._finish_human_wait()
+        self._finalize_metrics()
         self.state.task_status = TaskStatus.COMPLETED
         self.state.agent_status = SystemComponentStatus.IDLE
-        self.add_chat_message("Task completed successfully in mock simulation.", sent=False, name=self.agent_name)
+        self.add_chat_message("The complete simulated pick-and-place task finished successfully.", sent=False, name=self.agent_name)
         self.append_event("task_completed")
 
     def complete_active_trajectory_review(self) -> None:
@@ -922,7 +1150,11 @@ class GuiController:
         self.append_event("task_status_changed", old_value=old_status.value, new_value=status.value)
 
     def append_event(self, event_type: str, *, node_id: str | None = None, old_value: Any = None, new_value: Any = None, metadata: dict[str, Any] | None = None) -> ExecutionEvent:
-        event = ExecutionEvent(f"event-{uuid.uuid4().hex[:8]}", self.state.current_task_id, node_id, event_type, utc_now(), self.state.current_plan_version, old_value, new_value, metadata or {})
+        metadata = dict(metadata or {})
+        metadata.setdefault("target_id", self.state.current_target_id)
+        metadata.setdefault("grasp_candidate_id", self.state.current_grasp_candidate_id)
+        metadata.setdefault("trajectory_id", self.state.current_trajectory_id)
+        event = ExecutionEvent(f"event-{uuid.uuid4().hex[:8]}", self.state.current_task_id, node_id, event_type, utc_now(), self.state.current_plan_version, old_value, new_value, metadata)
         self.state.event_log.append(event)
         if self.state.current_task_plan is not None:
             self.state.current_task_plan.status = self.state.task_status.value
@@ -952,6 +1184,9 @@ class GuiController:
         self.state.tool_nodes.clear()
         self.state.pending_hitl_request = None
         self.state.current_trajectory_id = None
+        self.state.current_target_id = None
+        self.state.current_grasp_candidate_id = None
+        self.state.experiment_metrics = TaskExperimentMetrics()
         self.state.modification_history.clear()
         if clear_conversation:
             self.state.conversation.clear()
@@ -1010,6 +1245,8 @@ class GuiController:
         self.state.component_processes = self.component_manager.refresh()
 
     def start_component(self, component_id: str, *, confirmed: bool = False):
+        if component_id == "ur5_real" and self.gui_config.get("phase9", {}).get("simulation_only", True):
+            raise RuntimeError("Phase 9 is simulation-only; the real UR5 driver is disabled.")
         self.append_event("component_start_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
         managed = self.component_manager.start_component(component_id, confirmed=confirmed)
         if component_id == "ur5_fake" and managed.status.value == "RUNNING":
@@ -1036,8 +1273,21 @@ class GuiController:
         return managed
 
     def confirm_real_ur5_start(self):
+        if self.gui_config.get("phase9", {}).get("simulation_only", True):
+            raise RuntimeError("Phase 9 is simulation-only; real robot startup is disabled.")
         self.append_event("real_robot_driver_confirmed", metadata={"component_id": "ur5_real", "robot_ip": "192.168.10.27", "initiated_by": "gui"})
         return self.start_component("ur5_real", confirmed=True)
+
+    def _finish_human_wait(self) -> None:
+        started = self.state.experiment_metrics.human_wait_started_at
+        if started:
+            self.state.experiment_metrics.human_wait_time_ms += self._duration_ms(started, utc_now()) or 0
+            self.state.experiment_metrics.human_wait_started_at = None
+
+    def _finalize_metrics(self) -> None:
+        metrics = self.state.experiment_metrics
+        metrics.task_finished_at = utc_now()
+        metrics.total_task_time_ms = self._duration_ms(metrics.task_started_at, metrics.task_finished_at)
 
     def start_simulation_components(self):
         """Launch only the configured simulation stack, with ROS-health gating."""
