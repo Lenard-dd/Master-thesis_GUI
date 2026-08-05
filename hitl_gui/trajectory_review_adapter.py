@@ -20,6 +20,7 @@ class TrajectoryRecord:
     planning_result: dict[str, Any]
     validation_result: dict[str, Any]
     planning_time_ms: int
+    planning_request: dict[str, Any]
     invalidated: bool = False
 
     @property
@@ -56,6 +57,49 @@ class ExistingTrajectoryReviewAdapter:
             planning_result=result,
             validation_result=validation,
             planning_time_ms=elapsed_ms,
+            planning_request={"kind": "named_target", "target": target},
+        )
+        self.records[trajectory_id] = record
+        return record
+
+    def plan_pose(
+        self,
+        pose: dict[str, Any],
+        plan_version: int,
+        *,
+        skill_id: str,
+        velocity_scale: float = 0.03,
+        acceleration_scale: float = 0.03,
+        planning_kwargs: dict[str, Any] | None = None,
+    ) -> TrajectoryRecord:
+        """Plan one existing MoveIt pose motion; execution remains cached/gated."""
+        required = ("frame", "position", "orientation")
+        if not isinstance(pose, dict) or any(key not in pose for key in required):
+            raise ValueError("A pose trajectory requires frame, position, and orientation.")
+        started = monotonic()
+        result = self.backend.plan_to_pose(
+            frame=pose["frame"], position=pose["position"], orientation=pose["orientation"],
+            velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
+            skill_id=skill_id, **dict(planning_kwargs or {}),
+        )
+        elapsed_ms = int((monotonic() - started) * 1000)
+        summary = result.get("summary", {})
+        validation = self.validator.validate_motion_plan_summary(summary)
+        trajectory_id = str(result.get("plan_id") or summary.get("plan_id") or "")
+        if not trajectory_id:
+            raise RuntimeError("Existing MoveIt backend returned no plan_id.")
+        record = TrajectoryRecord(
+            trajectory_id=trajectory_id,
+            plan_version=plan_version,
+            target_summary=f"{skill_id}: pose in {pose['frame']}",
+            planning_result=result,
+            validation_result=validation,
+            planning_time_ms=elapsed_ms,
+            planning_request={
+                "kind": "pose", "pose": pose, "skill_id": skill_id,
+                "velocity_scale": velocity_scale, "acceleration_scale": acceleration_scale,
+                "planning_kwargs": dict(planning_kwargs or {}),
+            },
         )
         self.records[trajectory_id] = record
         return record

@@ -329,6 +329,16 @@ class GuiController:
         if self.trajectory_adapter is not None:
             return self.trajectory_adapter
         if self.ros_worker is None:
+            if (
+                self.runtime_backend_config.perception_mode == "mock"
+                and self.runtime_backend_config.grasp_mode == "mock"
+            ):
+                from hitl_gui.mock.mock_trajectory_backend import MockMotionBackend, MockTrajectoryValidator
+                self.trajectory_adapter = ExistingTrajectoryReviewAdapter(
+                    MockMotionBackend(), MockTrajectoryValidator(), visualizer=None,
+                )
+                self.trajectory_adapter.run_in_worker = False
+                return self.trajectory_adapter
             raise RuntimeError("ROS monitoring must be enabled before requesting a MoveIt trajectory.")
         from llm_skill_robot.core.execution_mode import load_execution_config
         from llm_skill_robot.core.trajectory_validator import TrajectoryValidator
@@ -361,6 +371,20 @@ class GuiController:
         self._last_trajectory_task = asyncio.create_task(self._plan_named_target_trajectory(target, source_node_id))
         return self._last_trajectory_task
 
+    def request_pose_trajectory(
+        self, pose: dict[str, Any], *, skill_id: str, source_node_id: str | None = None,
+        velocity_scale: float = 0.03, acceleration_scale: float = 0.03,
+        planning_kwargs: dict[str, Any] | None = None,
+    ):
+        """Schedule one existing MoveIt pose plan for a Safe Pick motion node."""
+        self._last_trajectory_task = asyncio.create_task(
+            self._plan_pose_trajectory(
+                pose, skill_id, source_node_id, velocity_scale,
+                acceleration_scale, planning_kwargs or {},
+            )
+        )
+        return self._last_trajectory_task
+
     async def _plan_named_target_trajectory(self, target: str, source_node_id: str | None) -> None:
         self.state.task_status = TaskStatus.PLANNING
         self.append_event("trajectory_planning_started", node_id=source_node_id, metadata={"target": target})
@@ -382,11 +406,49 @@ class GuiController:
         self.append_event("trajectory_preview_published", node_id=source_node_id,
                           metadata={"trajectory_id": record.trajectory_id, "preview": preview})
 
+    async def _plan_pose_trajectory(
+        self, pose: dict[str, Any], skill_id: str, source_node_id: str | None,
+        velocity_scale: float, acceleration_scale: float, planning_kwargs: dict[str, Any],
+    ) -> None:
+        self.state.task_status = TaskStatus.PLANNING
+        self.append_event("trajectory_planning_started", node_id=source_node_id,
+                          metadata={"skill_id": skill_id, "target_pose": pose,
+                                    "velocity_scale": velocity_scale,
+                                    "acceleration_scale": acceleration_scale,
+                                    "planning_kwargs": planning_kwargs})
+        try:
+            adapter = self._ensure_trajectory_adapter()
+            if adapter.run_in_worker:
+                record = await asyncio.to_thread(
+                    adapter.plan_pose, pose, self.state.current_plan_version, skill_id=skill_id,
+                    velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
+                    planning_kwargs=planning_kwargs,
+                )
+            else:
+                record = adapter.plan_pose(
+                    pose, self.state.current_plan_version, skill_id=skill_id,
+                    velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
+                    planning_kwargs=planning_kwargs,
+                )
+        except Exception as exc:
+            self.state.task_status = TaskStatus.FAILED
+            self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=str(exc)) if source_node_id else None
+            self.append_event("tool_failed", node_id=source_node_id, metadata={"reason": str(exc), "skill_id": skill_id})
+            self.add_chat_message(f"MoveIt pose planning failed: {exc}", sent=False, name="System")
+            return
+        self._create_trajectory_review_request(record, source_node_id)
+        preview = adapter.preview(record.trajectory_id)
+        self.append_event("trajectory_preview_published", node_id=source_node_id,
+                          metadata={"trajectory_id": record.trajectory_id, "preview": preview})
+
     def _create_trajectory_review_request(self, record, source_node_id: str | None) -> HitlRequest:
         summary = record.summary
         trajectory_id = record.trajectory_id
         self.state.current_trajectory_id = trajectory_id
-        review_node_id = f"trajectory_review_attempt_{record.plan_version}"
+        # A Safe Pick contains several motion reviews under the same plan
+        # version.  The trajectory ID prevents later approvals from resolving
+        # the first review node by mistake.
+        review_node_id = f"trajectory_review_{trajectory_id}"
         review_node = ToolNode(
             node_id=review_node_id, parent_id=source_node_id, tool_name="trajectory_review",
             display_name=f"Trajectory Review (Attempt {record.plan_version})",
@@ -549,6 +611,12 @@ class GuiController:
                                     "execution_duration": result.get("execution_duration"),
                                     "controller_result": result})
         self.add_chat_message(result.get("message", "Trajectory execution finished."), sent=False, name="System")
+        review = self._node(request.target_id)
+        source_node_id = review.parent_id if review else None
+        if success and source_node_id:
+            self.update_tool_status(source_node_id, ToolStatus.SUCCEEDED,
+                                    output_summary={"trajectory_id": trajectory_id, "controller_result": result})
+            self.skill_runtime.on_motion_execution_completed(source_node_id)
 
     def replan_trajectory(self, request_id: str, reason: str) -> bool:
         request = self.state.pending_hitl_request
@@ -575,10 +643,21 @@ class GuiController:
         self.append_event("plan_version_changed", old_value=old_version, new_value=self.state.current_plan_version,
                           metadata={"reason": reason})
         target = record.summary.get("target_name")
-        if not target:
+        source_node_id = review.parent_id if review else None
+        if target:
+            self.request_named_target_trajectory(target, source_node_id=source_node_id)
+        elif record.planning_request.get("kind") == "pose":
+            self.request_pose_trajectory(
+                record.planning_request["pose"],
+                skill_id=record.planning_request.get("skill_id", "move_to_pose"),
+                source_node_id=source_node_id,
+                velocity_scale=record.planning_request.get("velocity_scale", 0.03),
+                acceleration_scale=record.planning_request.get("acceleration_scale", 0.03),
+                planning_kwargs=record.planning_request.get("planning_kwargs", {}),
+            )
+        else:
             self.state.task_status = TaskStatus.FAILED
             return False
-        self.request_named_target_trajectory(target, source_node_id=review.parent_id if review else None)
         return True
 
     def _submit_agent_hitl_decision(self, request: HitlRequest, decision: HitlDecision) -> bool:
@@ -632,10 +711,10 @@ class GuiController:
                     )
             elif node and node.tool_name == "review_grasp_candidate" and request.request_type == "grasp_candidate":
                 node.status = ToolStatus.SUCCEEDED
-                self.state.task_status = TaskStatus.APPROVED_PENDING_EXECUTION
-                self.add_chat_message(
-                    "Grasp candidate approval was recorded. Motion planning will use the existing MoveIt trajectory-review path and is not started automatically.",
-                    sent=False, name="System",
+                self.skill_runtime.continue_after_grasp_review(node)
+            elif node and node.tool_name in {"open_gripper", "close_gripper"} and request.request_type == "execution":
+                self._last_skill_task = asyncio.create_task(
+                    self.skill_runtime.execute_gripper_after_release(node)
                 )
         else:
             if node:
