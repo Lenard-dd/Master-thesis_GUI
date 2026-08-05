@@ -2,14 +2,14 @@ from nicegui import ui
 
 
 def create_chat_panel(controller):
-    with ui.card().classes("w-full h-full min-h-[520px]"):
+    with ui.card().classes("w-full min-h-[460px]"):
         ui.label("Chat").classes("text-lg font-semibold")
 
         # Keep the actual scroll container outside the refreshable region.
         # Re-creating the container on every UI refresh resets its position to
         # the top, which makes it impossible to read the newest messages.
         rendered = {"message_count": -1}
-        with ui.scroll_area().classes("w-full flex-grow h-[390px]") as message_scroll:
+        with ui.scroll_area().classes("w-full flex-grow h-[330px]") as message_scroll:
 
             @ui.refreshable
             def messages_view():

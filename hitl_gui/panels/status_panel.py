@@ -5,8 +5,8 @@ from nicegui import ui
 
 def create_status_panel(controller):
     """Create buttons once; refresh only the read-only status content."""
-    with ui.card().classes("w-full h-full min-h-[520px]"):
-        ui.label("System Status").classes("text-lg font-semibold")
+    with ui.card().classes("w-full h-full min-h-[520px] p-3"):
+        ui.label("System Status").classes("text-base font-semibold")
 
         @ui.refreshable
         def status_view():
@@ -19,25 +19,20 @@ def create_status_panel(controller):
                 (process for process in ur5_processes if process.status.value in {"STARTING", "RUNNING", "STOPPING"}),
                 ur5_processes[-1] if ur5_processes else None,
             )
-            with ui.column().classes("w-full gap-2"):
-                with ui.row().classes("w-full gap-4 text-sm"):
-                    ui.label(f"UR5 Process: {ur5_process.status.value if ur5_process else 'STOPPED'}")
-                    ui.label(f"UR5 ROS Health: {state.hardware_status['UR5'].value}")
-                    ui.label(f"RViz Process: {state.rviz_process_status}")
-                ui.label(f"Runtime backends: {controller.runtime_adapters.mode_summary}").classes("text-grey")
-                ui.label(f"Simulation launcher: {state.simulation_launch_status}").classes("text-grey")
-                with ui.grid(columns=1).classes("w-full gap-2"):
-                    for name, status in [(controller.agent_name, state.agent_status), *state.hardware_status.items()]:
-                        with ui.card().classes("w-full p-2"):
-                            with ui.row().classes("w-full items-center justify-between"):
-                                ui.label(name).classes("font-medium")
-                                value = state.rviz_process_status if name == "RViz2" else status.value
-                                ui.badge(value, color="negative" if value in {"DISCONNECTED", "ERROR"} else "primary")
+            with ui.column().classes("w-full gap-1 text-xs"):
+                _status_line("UR5 Process", ur5_process.status.value if ur5_process else "STOPPED")
+                _status_line("UR5 Health", state.hardware_status["UR5"].value)
+                _status_line("RViz Process", state.rviz_process_status)
+                ui.label(f"Backends: {controller.runtime_adapters.mode_summary}").classes("text-grey text-xs")
+                ui.label(f"Launcher: {state.simulation_launch_status}").classes("text-grey text-xs")
+                ui.separator().classes("my-1")
+                for name, status in [(controller.agent_name, state.agent_status), *state.hardware_status.items()]:
+                    value = state.rviz_process_status if name == "RViz2" else status.value
+                    _status_line(name, value)
 
         status_view()
-        ui.separator()
-        ui.label("Component Controls").classes("font-semibold")
-        _create_stable_controls(controller)
+        with ui.expansion("Component Controls", icon="settings").classes("w-full text-sm"):
+            _create_stable_controls(controller)
     return status_view
 
 
@@ -48,21 +43,32 @@ def _create_stable_controls(controller):
         ("Robotiq 2F-140", "gripper"),
         ("GraspGenX", "graspgenx"),
     ]:
-        with ui.row().classes("w-full items-center gap-2"):
-            ui.label(title).classes("w-40")
-            ui.button("Start", on_click=lambda cid=component_id: controller.start_component(cid)).props("dense")
-            ui.button("Stop", on_click=lambda cid=component_id: controller.stop_component(cid)).props("dense outline")
-            ui.button("Restart", on_click=lambda cid=component_id: controller.restart_component(cid)).props("dense outline")
+        with ui.column().classes("w-full gap-1"):
+            ui.label(title).classes("text-xs font-medium")
+            with ui.row().classes("w-full gap-1 flex-wrap"):
+                ui.button("Start", on_click=lambda cid=component_id: controller.start_component(cid)).props("dense size=sm")
+                ui.button("Stop", on_click=lambda cid=component_id: controller.stop_component(cid)).props("dense size=sm outline")
+                ui.button("Restart", on_click=lambda cid=component_id: controller.restart_component(cid)).props("dense size=sm outline")
 
-    with ui.row().classes("w-full items-center gap-2"):
-        ui.label("UR5").classes("w-40")
-        ui.button("Start Fake", on_click=lambda: controller.start_component("ur5_fake")).props("dense")
-        ui.button("Start Real", on_click=lambda: _real_dialog(controller)).props("dense color=negative")
-        ui.button("Stop", on_click=lambda: controller.stop_component("ur5_fake")).props("dense outline")
-        ui.button("Restart", on_click=lambda: controller.restart_component("ur5_fake")).props("dense outline")
-    with ui.row().classes("gap-2 mt-2"):
-        ui.button("Start Simulation Components", on_click=controller.start_simulation_components)
-        ui.button("Stop GUI-Managed Components", on_click=controller.stop_gui_managed_components).props("outline")
+    with ui.column().classes("w-full gap-1"):
+        ui.label("UR5").classes("text-xs font-medium")
+        with ui.row().classes("w-full gap-1 flex-wrap"):
+            ui.button("Fake", on_click=lambda: controller.start_component("ur5_fake")).props("dense size=sm")
+            ui.button("Real", on_click=lambda: _real_dialog(controller)).props("dense size=sm color=negative")
+            ui.button("Stop", on_click=lambda: controller.stop_component("ur5_fake")).props("dense size=sm outline")
+            ui.button("Restart", on_click=lambda: controller.restart_component("ur5_fake")).props("dense size=sm outline")
+    with ui.column().classes("w-full gap-1 mt-2"):
+        ui.button("Start Simulation", on_click=controller.start_simulation_components).props("dense size=sm")
+        ui.button("Stop GUI-Managed", on_click=controller.stop_gui_managed_components).props("dense size=sm outline")
+
+
+def _status_line(name: str, value: str) -> None:
+    color = "negative" if value in {"DISCONNECTED", "ERROR"} else (
+        "warning" if value in {"WARNING", "UNKNOWN"} else "primary"
+    )
+    with ui.row().classes("w-full items-center justify-between gap-1 no-wrap"):
+        ui.label(name).classes("text-xs truncate")
+        ui.badge(value, color=color).props("outline").classes("text-[10px]")
 
 
 def _real_dialog(controller):

@@ -106,14 +106,17 @@ class GuiController:
             renderers = []
             with ui.splitter(value=32).classes("w-full flex-grow min-h-[520px]") as outer:
                 with outer.before:
-                    chat_renderer = create_chat_panel(self)
+                    with ui.column().classes("w-full h-full gap-4 pr-2"):
+                        chat_renderer = create_chat_panel(self)
+                        hitl_renderer = create_hitl_panel(self)
                 with outer.after:
-                    with ui.splitter(value=64).classes("w-full h-full") as inner:
+                    # Keep System Status as a compact sidebar; the execution
+                    # tree benefits more from horizontal space.
+                    with ui.splitter(value=76).classes("w-full h-full") as inner:
                         with inner.before:
                             tool_flow_renderer = create_tool_flow_panel(self)
                         with inner.after:
                             renderers.append(create_status_panel(self))
-            hitl_renderer = create_hitl_panel(self)
             # Audit log updates are event-driven. Keeping it out of the ROS
             # monitor's 5 Hz renderer list preserves pagination and selection.
             self._log_renderer = create_log_panel(self)
