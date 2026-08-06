@@ -42,6 +42,25 @@ ros_monitor:
 rviz:
   executable: "rviz2"
   config_path: "/home/lenard/dev_ws/src/ur_src/ur5_launcher/config/moveit.rviz"
+embedded_rviz:
+  enabled: true
+  display: ":99"
+  screen_resolution: "2560x1440x24"
+  vnc_host: "127.0.0.1"
+  vnc_port: 5901
+  novnc_host: "127.0.0.1"
+  novnc_port: 6080
+  novnc_web_root: "/usr/share/novnc"
+  iframe_url: "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale&host=127.0.0.1&port=6080"
+  rviz_config: "/home/lenard/dev_ws/src/hitl_gui/config/embedded_robot_only.rviz"
+  software_rendering: true
+  auto_start: false
+simulation_motion:
+  # Used only while the GUI runs in SIMULATION mode. These values determine
+  # MoveIt's trajectory timing, so RViz previews and fake-hardware execution
+  # move at the same speed. Real-robot limits are intentionally unaffected.
+  velocity_scale: 0.10
+  acceleration_scale: 0.10
 system_launcher:
   ros_domain_id: 27
   workspace_path: "/home/lenard/dev_ws"

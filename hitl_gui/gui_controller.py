@@ -17,6 +17,7 @@ from hitl_gui.app_state import (
 from hitl_gui.mock.mock_task_runner import MockTaskRunner
 from hitl_gui.session_logger import SessionLogger
 from hitl_gui.rviz_process_manager import RvizProcessManager, load_gui_config
+from hitl_gui.services.embedded_rviz_manager import EmbeddedRvizManager
 from hitl_gui.ros_worker import RosWorker
 from hitl_gui.message_converter import component_status
 from hitl_gui.component_process_manager import ComponentProcessManager
@@ -34,6 +35,7 @@ from hitl_gui.panels.log_panel import create_log_panel
 from hitl_gui.panels.status_panel import create_status_panel
 from hitl_gui.panels.tool_flow_panel import create_tool_flow_panel
 from hitl_gui.panels.component_log_panel import create_component_log_panel
+from hitl_gui.panels.embedded_rviz_panel import EmbeddedRvizPanel
 
 
 FLOW = [
@@ -93,6 +95,7 @@ class GuiController:
             rviz_settings.get("config_path", ""),
             executable=rviz_settings.get("executable", "rviz2"),
         )
+        self.embedded_rviz_manager = EmbeddedRvizManager(self.gui_config.get("embedded_rviz", {}))
         self.ros_worker: RosWorker | None = None
         self.component_manager = ComponentProcessManager(self.gui_config.get("system_launcher", {}))
         self.runtime_backend_config = RuntimeBackendConfig.from_gui_config(self.gui_config)
@@ -108,24 +111,34 @@ class GuiController:
         with ui.column().classes("w-full min-h-screen gap-4 p-4"):
             header_renderer = create_header_panel(self)
             renderers = []
-            with ui.splitter(value=32).classes("w-full flex-grow min-h-[520px]") as outer:
+            # Keep conversation focused but leave the primary workspace for
+            # the task tree and its live RViz trajectory preview.
+            with ui.splitter(value=24).classes("w-full flex-grow min-h-[720px]") as outer:
                 with outer.before:
                     with ui.column().classes("w-full h-full gap-4 pr-2"):
                         chat_renderer = create_chat_panel(self)
                         hitl_renderer = create_hitl_panel(self)
                 with outer.after:
-                    # Keep System Status as a compact sidebar; the execution
-                    # tree benefits more from horizontal space.
-                    with ui.splitter(value=76).classes("w-full h-full") as inner:
-                        with inner.before:
-                            tool_flow_renderer = create_tool_flow_panel(self)
-                        with inner.after:
-                            renderers.append(create_status_panel(self))
+                    with ui.column().classes("w-full h-full gap-3 pl-2"):
+                        # Planning steps and the 3D trajectory view remain
+                        # side-by-side so an operator can correlate them.
+                        with ui.splitter(value=50).classes("w-full min-h-[700px]") as inner:
+                            with inner.before:
+                                tool_flow_renderer = create_tool_flow_panel(self)
+                            with inner.after:
+                                embedded_rviz_renderer = EmbeddedRvizPanel(
+                                    self.embedded_rviz_manager,
+                                    self.gui_config.get("embedded_rviz", {}).get("iframe_url", ""),
+                                    open_native_rviz=self.start_rviz,
+                                ).render()
+                        # Status is useful context, but should not take a
+                        # permanent vertical sidebar away from the task tree.
+                        renderers.append(create_status_panel(self, compact=True))
             # Audit log updates are event-driven. Keeping it out of the ROS
             # monitor's 5 Hz renderer list preserves pagination and selection.
             self._log_renderer = create_log_panel(self)
             component_log_renderer = create_component_log_panel(self)
-        self._event_renderers = [header_renderer.refresh, chat_renderer, tool_flow_renderer, hitl_renderer]
+        self._event_renderers = [header_renderer.refresh, chat_renderer, tool_flow_renderer, hitl_renderer, embedded_rviz_renderer]
         # Header contains ROS state, while component output arrives from child
         # processes. They need periodic updates, but not monitor-frequency UI
         # reconstruction.
@@ -588,8 +601,27 @@ class GuiController:
             backend,
             TrajectoryValidator(self._load_safety_config()),
             TrajectoryVisualizer(node=backend.node, topic=execution_config.get("visual_preview_topic", "/display_planned_path")),
+            **self._simulation_motion_adapter_options(real_robot=real_robot),
         )
         return self.trajectory_adapter
+
+    def simulation_motion_scales(self) -> tuple[float, float]:
+        """Return bounded MoveIt scales for fake-hardware simulation only."""
+        settings = self.gui_config.get("simulation_motion", {})
+        velocity = float(settings.get("velocity_scale", 0.03))
+        acceleration = float(settings.get("acceleration_scale", 0.03))
+        if not 0.0 < velocity <= 0.10 or not 0.0 < acceleration <= 0.10:
+            raise ValueError("simulation_motion scales must be greater than 0 and at most 0.10.")
+        return velocity, acceleration
+
+    def _simulation_motion_adapter_options(self, *, real_robot: bool) -> dict[str, float]:
+        if real_robot:
+            return {}
+        velocity, acceleration = self.simulation_motion_scales()
+        return {
+            "named_velocity_scale": velocity,
+            "named_acceleration_scale": acceleration,
+        }
 
     def request_named_target_trajectory(self, target: str, *, source_node_id: str | None = None):
         """Schedule existing MoveIt planning; never create a new execution path."""
@@ -1236,6 +1268,7 @@ class GuiController:
                           metadata={"trajectory_id": trajectory_id, "preview": result})
 
     def shutdown(self) -> None:
+        self.embedded_rviz_manager.cleanup()
         self.stop_rviz()
         if self.ros_worker:
             self.ros_worker.shutdown()

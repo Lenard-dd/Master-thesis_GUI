@@ -492,6 +492,8 @@ class GuiSkillRuntimeAdapter:
 
     def _prepare_grasp_motion_context(self, task_id: str) -> None:
         """Reuse terminal grasp pose conversion and stage-specific MoveIt policy."""
+        from dataclasses import replace
+
         from llm_skill_robot.core.grasp_motion_policy import GraspMotionPolicy
         from llm_skill_robot.ros_nl_rviz_sim_demo import _load_grasping_config
         from llm_skill_robot.safety.real_arm_safety import load_real_arm_safety
@@ -505,6 +507,15 @@ class GuiSkillRuntimeAdapter:
             max_velocity_scale=safety.limits.max_velocity_scale,
             max_acceleration_scale=safety.limits.max_acceleration_scale,
         )
+        # The real-arm safety limits remain the authoritative cap in REAL
+        # mode. Fake hardware uses the GUI's explicit, bounded demo speed.
+        if self.controller.state.robot_mode not in {"REAL", "REAL ROBOT"}:
+            velocity, acceleration = self.controller.simulation_motion_scales()
+            context["grasp_motion_policy"] = replace(
+                context["grasp_motion_policy"],
+                velocity_scale=velocity,
+                acceleration_scale=acceleration,
+            )
         # MockPerceptionAdapter already gives deterministic base_link poses.
         if isinstance(context.get("grasp_motion_poses"), dict):
             return

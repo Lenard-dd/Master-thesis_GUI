@@ -14,8 +14,10 @@ class FakeBackend:
     def __init__(self):
         self.counter = 0
         self.executed = []
+        self.named_target_calls = []
 
-    def plan_to_named_target(self, target, **_kwargs):
+    def plan_to_named_target(self, target, **kwargs):
+        self.named_target_calls.append(kwargs)
         self.counter += 1
         plan_id = f"plan-{self.counter}"
         return {"plan_id": plan_id, "success": True, "summary": {
@@ -51,6 +53,20 @@ def _controller_with_adapter():
     controller.set_trajectory_adapter(adapter)
     controller.state.current_task_id = "task-trajectory"
     return controller, backend
+
+
+def test_named_target_uses_the_configured_simulation_timing_scales():
+    backend = FakeBackend()
+    adapter = ExistingTrajectoryReviewAdapter(
+        backend, FakeValidator(), named_velocity_scale=0.10,
+        named_acceleration_scale=0.10,
+    )
+    adapter.plan_named_target("home", 1)
+    assert backend.named_target_calls == [{
+        "velocity_scale": 0.10,
+        "acceleration_scale": 0.10,
+        "skill_id": "move_to_named_target",
+    }]
 
 
 def test_old_request_cannot_approve_after_replan_and_old_trajectory_cannot_execute():

@@ -31,17 +31,29 @@ class TrajectoryRecord:
 class ExistingTrajectoryReviewAdapter:
     """Use existing MoveIt, validation, RViz preview and execution interfaces."""
 
-    def __init__(self, backend, validator, visualizer=None) -> None:
+    def __init__(
+        self,
+        backend,
+        validator,
+        visualizer=None,
+        *,
+        named_velocity_scale: float = 0.03,
+        named_acceleration_scale: float = 0.03,
+    ) -> None:
         self.backend = backend
         self.validator = validator
         self.visualizer = visualizer
+        self.named_velocity_scale = named_velocity_scale
+        self.named_acceleration_scale = named_acceleration_scale
         self.records: dict[str, TrajectoryRecord] = {}
         self.run_in_worker = True
 
     def plan_named_target(self, target: str, plan_version: int) -> TrajectoryRecord:
         started = monotonic()
         result = self.backend.plan_to_named_target(
-            target=target, velocity_scale=0.03, acceleration_scale=0.03,
+            target=target,
+            velocity_scale=self.named_velocity_scale,
+            acceleration_scale=self.named_acceleration_scale,
             skill_id="move_to_named_target",
         )
         elapsed_ms = int((monotonic() - started) * 1000)

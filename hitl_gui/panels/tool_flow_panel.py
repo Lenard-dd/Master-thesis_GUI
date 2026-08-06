@@ -153,14 +153,14 @@ def create_tool_flow_panel(controller):
 
         plan_header()
         with ui.element("div").classes(
-            "w-full grid grid-cols-1 xl:grid-cols-[minmax(0,70fr)_minmax(250px,30fr)] gap-2 items-start"
+            "w-full grid grid-cols-1 2xl:grid-cols-[minmax(0,70fr)_minmax(250px,30fr)] gap-2 items-start"
         ):
             with ui.column().classes("w-full min-w-0"):
                 # Keep the scroll container stable while refreshable rebuilds
                 # only its contents; this preserves its scroll position.
                 with ui.scroll_area().classes("w-full h-[65vh] min-h-[420px] max-h-[720px]") as task_scroll:
                     task_flow()
-            with ui.column().classes("w-full min-w-0 xl:sticky xl:top-2"):
+            with ui.column().classes("w-full min-w-0 2xl:sticky 2xl:top-2"):
                 details_panel()
 
         scroll_state["signature"] = timeline_signature(controller.state.current_task_plan)
@@ -220,12 +220,10 @@ def _node_row(controller, node, step_label, labels, on_select, current_plan_vers
         with ui.row().classes("w-full min-h-[38px] items-center gap-2 no-wrap"):
             ui.label(step_label).classes("w-8 text-center text-xs font-mono text-grey-7")
             ui.icon(presentation["icon"], color=presentation["color"]).classes("text-base")
-            ui.label(node.display_name).classes("text-sm font-medium min-w-[120px] truncate")
-            if summary not in GENERIC_SUMMARIES:
-                ui.label(summary).classes("text-xs text-grey-7 truncate flex-grow")
-            else:
-                ui.element("div").classes("flex-grow")
+            ui.label(node.display_name).classes("text-sm font-medium min-w-0 flex-grow truncate")
             ui.badge(str(node.status), color=presentation["color"]).props("outline").classes("text-[9px]")
+        if summary not in GENERIC_SUMMARIES:
+            ui.label(summary).classes("w-full pl-10 text-xs text-grey-7 break-words")
         if expanded:
             _node_meta(node, attempts, labels, current_plan_version)
 
@@ -240,8 +238,7 @@ def _review_row(controller, node, step_label, labels, on_select, current_plan_ve
         with ui.row().classes("w-full min-h-[32px] items-center gap-2 no-wrap"):
             ui.label(step_label).classes("w-8 text-center text-[10px] font-mono text-grey-7")
             ui.icon(presentation["icon"], color=presentation["color"]).classes("text-sm")
-            ui.label(node.display_name).classes("text-xs font-medium truncate")
-            ui.element("div").classes("flex-grow")
+            ui.label(node.display_name).classes("text-xs font-medium min-w-0 truncate flex-grow")
             if node.plan_version > 1 or node.plan_version != current_plan_version:
                 ui.badge(f"v{node.plan_version}").props("outline color=grey-7").classes("text-[8px]")
             ui.badge(str(node.status), color=presentation["color"]).props("outline").classes("text-[8px]")
