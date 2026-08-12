@@ -35,6 +35,7 @@ from hitl_gui.panels.log_panel import create_log_panel
 from hitl_gui.panels.status_panel import create_status_panel
 from hitl_gui.panels.tool_flow_panel import create_tool_flow_panel
 from hitl_gui.panels.component_log_panel import create_component_log_panel
+from hitl_gui.panels.task_summary_panel import create_task_summary_panel
 from hitl_gui.panels.embedded_rviz_panel import EmbeddedRvizPanel
 
 
@@ -63,7 +64,8 @@ TASK_STATUS_BY_TOOL = {
 class GuiController:
     """Coordinates state changes while remaining entirely mock-only."""
 
-    def __init__(self, step_delay: float = 0.6, log_root: str = "logs") -> None:
+    def __init__(self, step_delay: float = 0.6, log_root: str | None = None,
+                 config_overrides: dict[str, Any] | None = None) -> None:
         # Assigned once a browser page is built. Audit events may also be
         # created during controller construction, before a panel exists.
         self._log_renderer = None
@@ -86,10 +88,11 @@ class GuiController:
         self.task_plan_adapter = TaskPlanAdapter()
         self.plan_event_converter = PlanEventConverter()
         self.runner = MockTaskRunner(self, step_delay=step_delay)
-        self.session_logger = SessionLogger(log_root)
         self.gui_config = load_gui_config()
+        self._apply_config_overrides(config_overrides or {})
+        self.session_logger = SessionLogger(log_root or self.gui_config.get("log_directory", "logs"))
         self.agent_name = self.gui_config.get("agent_bridge", {}).get("display_name", "Milo")
-        self.state.robot_mode = self.gui_config.get("mode", "SIMULATION").upper()
+        self.state.robot_mode = self.gui_config.get("robot_mode", self.gui_config.get("mode", "SIMULATION")).upper()
         rviz_settings = self.gui_config.get("rviz", {})
         self.rviz_manager = RvizProcessManager(
             rviz_settings.get("config_path", ""),
@@ -137,15 +140,37 @@ class GuiController:
             # Audit log updates are event-driven. Keeping it out of the ROS
             # monitor's 5 Hz renderer list preserves pagination and selection.
             self._log_renderer = create_log_panel(self)
+            task_summary_renderer = create_task_summary_panel(self)
             component_log_renderer = create_component_log_panel(self)
-        self._event_renderers = [header_renderer.refresh, chat_renderer, tool_flow_renderer, hitl_renderer, embedded_rviz_renderer]
+        self._event_renderers = [header_renderer.refresh, chat_renderer, tool_flow_renderer, hitl_renderer,
+                                 embedded_rviz_renderer, task_summary_renderer]
         # Header contains ROS state, while component output arrives from child
         # processes. They need periodic updates, but not monitor-frequency UI
         # reconstruction.
         ui.timer(1.0, header_renderer.refresh)
         ui.timer(1.0, component_log_renderer.refresh)
-        refresh_hz = self.gui_config.get("ros_monitor", {}).get("refresh_hz", 5)
+        refresh_hz = self.gui_config.get("refresh_rate", self.gui_config.get("ros_monitor", {}).get("refresh_hz", 5))
         ui.timer(1.0 / max(1, refresh_hz), lambda: self._refresh_ui(renderers))
+
+    def _apply_config_overrides(self, overrides: dict[str, Any]) -> None:
+        """Apply explicit launch/CLI feature flags before runtime construction."""
+        if "agent_enabled" in overrides and not overrides["agent_enabled"]:
+            self.gui_config.setdefault("agent_bridge", {})["mode"] = "mock"
+        if "perception_enabled" in overrides:
+            self.gui_config.setdefault("runtime_backends", {})["perception_mode"] = (
+                "ros" if overrides["perception_enabled"] else "mock"
+            )
+        if "grasp_enabled" in overrides:
+            self.gui_config.setdefault("runtime_backends", {})["grasp_mode"] = (
+                "graspgenx" if overrides["grasp_enabled"] else "mock"
+            )
+        if "simulation" in overrides:
+            simulation = bool(overrides["simulation"])
+            self.gui_config["robot_mode"] = "SIMULATION" if simulation else "REAL ROBOT"
+            if simulation:
+                self.gui_config["enable_real_execution"] = False
+        if "gui_mode" in overrides:
+            self.gui_config["gui_mode"] = str(overrides["gui_mode"]).upper()
 
     def _refresh_ui(self, renderers) -> None:
         self.refresh_rviz_status()
@@ -561,9 +586,6 @@ class GuiController:
         self.trajectory_adapter = adapter
 
     def _ensure_trajectory_adapter(self) -> ExistingTrajectoryReviewAdapter:
-        if (self.gui_config.get("phase9", {}).get("simulation_only", True)
-                and self.state.robot_mode in {"REAL", "REAL ROBOT"}):
-            raise RuntimeError("Phase 9 trajectory planning/execution is restricted to SIMULATION.")
         if self.trajectory_adapter is not None:
             return self.trajectory_adapter
         if self.ros_worker is None:
@@ -660,8 +682,10 @@ class GuiController:
             if self.state.current_task_id:
                 self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", str(exc), ["Retry", "Replan", "Cancel"])
             return
+        self._apply_real_motion_safety(record)
         if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
             reason = "MoveIt returned no executable trajectory or validation blocked it."
+            self.state.task_status = TaskStatus.FAILED
             if source_node_id:
                 self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=reason,
                                         output_summary={"planning_result": record.summary,
@@ -712,8 +736,10 @@ class GuiController:
             if self.state.current_task_id:
                 self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", str(exc), ["Retry", "Select Another Grasp", "Replan", "Cancel"])
             return
+        self._apply_real_motion_safety(record)
         if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
             reason = "MoveIt returned no executable pose trajectory or validation blocked it."
+            self.state.task_status = TaskStatus.FAILED
             if source_node_id:
                 self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=reason,
                                         output_summary={"planning_result": record.summary,
@@ -729,6 +755,43 @@ class GuiController:
         preview = adapter.preview(record.trajectory_id)
         self.append_event("trajectory_preview_published", node_id=source_node_id,
                           metadata={"trajectory_id": record.trajectory_id, "preview": preview})
+
+    def _apply_real_motion_safety(self, record) -> None:
+        """Reuse restricted-real-arm checks before exposing a real trajectory."""
+        if self.state.robot_mode not in {"REAL", "REAL ROBOT"}:
+            return
+        from llm_skill_robot.safety.real_arm_safety import (
+            is_real_motion_skill_allowed, load_real_arm_safety,
+            validate_motion_summary, validate_named_target,
+        )
+
+        config = load_real_arm_safety()
+        request = record.planning_request
+        skill_id = str(request.get("skill_id") or "move_to_named_target")
+        checks = [is_real_motion_skill_allowed(skill_id, config)]
+        if request.get("kind") == "named_target":
+            checks.append(validate_named_target(str(request.get("target", "")), config))
+        checks.append(validate_motion_summary(record.summary, config))
+        blocked_reasons = [
+            str(check.get("reason", "Real-arm safety blocked motion."))
+            for check in checks if not check.get("allowed", False)
+        ]
+        if record.validation_result.get("decision") != "ALLOW":
+            blocked_reasons.extend(record.validation_result.get("reasons", [
+                "Trajectory validation did not allow this motion.",
+            ]))
+        if blocked_reasons:
+            record.validation_result = {
+                "decision": "BLOCK",
+                "reasons": blocked_reasons,
+                "warnings": [],
+            }
+            return
+        record.validation_result = {
+            **record.validation_result,
+            "decision": "ALLOW",
+            "real_arm_safety": "ALLOW",
+        }
 
     def _create_trajectory_review_request(self, record, source_node_id: str | None) -> HitlRequest:
         summary = record.summary
@@ -851,7 +914,8 @@ class GuiController:
                     self.cancel_task()
                     return True
             return self._submit_agent_hitl_decision(request, decision)
-        if (self.gui_config.get("phase9", {}).get("simulation_only", True)
+        if (decision == HitlDecision.APPROVE
+                and not self.gui_config.get("enable_real_execution", False)
                 and self.state.robot_mode in {"REAL", "REAL ROBOT"}):
             return False
         if request.plan_version != self.state.current_plan_version:
@@ -1171,6 +1235,16 @@ class GuiController:
         self.add_chat_message("The complete simulated pick-and-place task finished successfully.", sent=False, name=self.agent_name)
         self.append_event("task_completed")
 
+    def fail_task(self, message: str, *, node_id: str | None = None) -> None:
+        """Finalize an unrecoverable failure and persist its experiment summary."""
+        self._finish_human_wait()
+        self._finalize_metrics()
+        self.state.pending_hitl_request = None
+        self.state.task_status = TaskStatus.FAILED
+        self.state.agent_status = SystemComponentStatus.IDLE
+        self.add_chat_message(message, sent=False, name="System")
+        self.append_event("task_failed", node_id=node_id, metadata={"reason": message})
+
     def complete_active_trajectory_review(self) -> None:
         review = self._active_trajectory_review()
         if review:
@@ -1196,6 +1270,11 @@ class GuiController:
         if self._log_renderer is not None:
             self._log_renderer.refresh()
         self._refresh_event_views()
+        if event_type in {"task_completed", "task_cancelled", "task_failed"} and self.state.current_task_id:
+            try:
+                self.session_logger.export_task_summary(self.state)
+            except OSError as exc:
+                self._last_summary_error = str(exc)
         return event
 
     def _refresh_event_views(self) -> None:
@@ -1226,6 +1305,9 @@ class GuiController:
 
     def export_task_log(self):
         return self.session_logger.export_task(self.state)
+
+    def task_summary(self) -> dict[str, Any]:
+        return self.session_logger.build_task_summary(self.state)
 
     def start_rviz(self) -> dict:
         result = self.rviz_manager.start_rviz()
@@ -1278,8 +1360,8 @@ class GuiController:
         self.state.component_processes = self.component_manager.refresh()
 
     def start_component(self, component_id: str, *, confirmed: bool = False):
-        if component_id == "ur5_real" and self.gui_config.get("phase9", {}).get("simulation_only", True):
-            raise RuntimeError("Phase 9 is simulation-only; the real UR5 driver is disabled.")
+        if component_id == "ur5_real" and not self.gui_config.get("enable_real_execution", False):
+            raise RuntimeError("Real UR5 startup is disabled by enable_real_execution=false.")
         self.append_event("component_start_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
         managed = self.component_manager.start_component(component_id, confirmed=confirmed)
         if component_id == "ur5_fake" and managed.status.value == "RUNNING":
@@ -1306,8 +1388,8 @@ class GuiController:
         return managed
 
     def confirm_real_ur5_start(self):
-        if self.gui_config.get("phase9", {}).get("simulation_only", True):
-            raise RuntimeError("Phase 9 is simulation-only; real robot startup is disabled.")
+        if not self.gui_config.get("enable_real_execution", False):
+            raise RuntimeError("Real UR5 startup is disabled by enable_real_execution=false.")
         self.append_event("real_robot_driver_confirmed", metadata={"component_id": "ur5_real", "robot_ip": "192.168.10.27", "initiated_by": "gui"})
         return self.start_component("ur5_real", confirmed=True)
 

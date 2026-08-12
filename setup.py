@@ -1,3 +1,5 @@
+from glob import glob
+
 from setuptools import find_packages, setup
 
 
@@ -11,8 +13,8 @@ setup(
     data_files=[
         ("share/ament_index/resource_index/packages", ["resource/hitl_gui"]),
         (f"share/{package_name}", ["package.xml", "README.md"]),
-        (f"share/{package_name}/launch", ["launch/hitl_gui.launch.py"]),
-        (f"share/{package_name}/config", ["config/gui_config.yaml"]),
+        (f"share/{package_name}/launch", glob("launch/*.launch.py")),
+        (f"share/{package_name}/config", glob("config/*")),
     ],
     install_requires=["setuptools"],
     zip_safe=True,

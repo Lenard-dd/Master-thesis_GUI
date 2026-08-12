@@ -66,6 +66,7 @@ def test_live_backend_request_never_falls_back_to_mock_without_ros_node():
 def test_safe_pick_completes_the_full_mock_tree_through_each_hitl_gate():
     async def scenario():
         controller = GuiController()
+        controller.state.robot_mode = "SIMULATION"
         adapter = ExistingTrajectoryReviewAdapter(_Backend(), _Validator())
         adapter.run_in_worker = False
         controller.set_trajectory_adapter(adapter)

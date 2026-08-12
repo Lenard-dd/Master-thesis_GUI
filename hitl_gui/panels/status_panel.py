@@ -63,7 +63,7 @@ def _create_stable_controls(controller, *, compact: bool = False):
             with ui.row().classes("w-full gap-1 flex-wrap"):
                 ui.button("Fake", on_click=lambda: controller.start_component("ur5_fake")).props("dense size=sm")
                 real_button = ui.button("Real", on_click=lambda: _real_dialog(controller)).props("dense size=sm color=negative")
-                if controller.gui_config.get("phase9", {}).get("simulation_only", True):
+                if not controller.gui_config.get("enable_real_execution", False):
                     real_button.disable()
                     real_button.tooltip("Phase 9 is simulation-only")
                 ui.button("Stop", on_click=lambda: controller.stop_component("ur5_fake")).props("dense size=sm outline")

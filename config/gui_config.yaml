@@ -1,9 +1,20 @@
 host: "127.0.0.1"
 port: 8080
 reload: false
-mode: "SIMULATION"
+# Canonical Stage 10 runtime settings. Nested legacy settings below remain for
+# compatibility with the existing ROS monitor and process managers.
+refresh_rate: 5.0
+status_timeout:
+  ready_sec: 1.0
+  disconnected_sec: 3.0
+rviz_config: "config/embedded_robot_only.rviz"
+log_directory: "logs"
+robot_mode: "REAL ROBOT"
+enable_editable_nodes: false
+enable_real_execution: false
+mode: "REAL ROBOT"
 ros_status: "MOCK"
-gui_mode: "MOCK"  # MOCK keeps the demo independent; set ROS to start monitoring.
+gui_mode: "ROS"
 agent_bridge:
   display_name: "Milo"
   mode: "existing_openai"  # existing_scripted, existing_openai, or mock
@@ -20,8 +31,9 @@ runtime_backends:
     object_id: "mock_red_cube_1"
     confidence: 0.99
 phase9:
-  # The complete closed loop is intentionally enabled for fake hardware only.
-  simulation_only: true
+  # Real-mode planning and RViz preview are available. Physical execution is
+  # governed separately by the top-level enable_real_execution safety gate.
+  simulation_only: false
   place_named_target: "home"
   mock_verification_success: true
   target_review:
@@ -41,7 +53,7 @@ ros_monitor:
   planning_scene_service: "/get_planning_scene"
 rviz:
   executable: "rviz2"
-  config_path: "/home/lenard/dev_ws/src/ur_src/ur5_launcher/config/moveit.rviz"
+  config_path: "config/embedded_robot_only.rviz"
 embedded_rviz:
   enabled: true
   display: ":99"
@@ -52,7 +64,7 @@ embedded_rviz:
   novnc_port: 6080
   novnc_web_root: "/usr/share/novnc"
   iframe_url: "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale&host=127.0.0.1&port=6080"
-  rviz_config: "/home/lenard/dev_ws/src/hitl_gui/config/embedded_robot_only.rviz"
+  rviz_config: "config/embedded_robot_only.rviz"
   software_rendering: true
   auto_start: false
 simulation_motion:

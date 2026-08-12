@@ -9,6 +9,7 @@ def mock_controller(*args, **kwargs):
     """Keep phase-2 workflow tests independent of the user-selected LLM mode."""
     controller = GuiController(*args, **kwargs)
     controller.gui_config["agent_bridge"]["mode"] = "mock"
+    controller.state.robot_mode = "SIMULATION"
     return controller
 
 

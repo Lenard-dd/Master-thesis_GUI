@@ -5,11 +5,12 @@ from hitl_gui.gui_controller import GuiController
 from hitl_gui.message_converter import heartbeat_status
 
 
-def test_ros_unavailable_keeps_mock_gui_usable():
+def test_real_monitoring_mode_initializes_without_blocking_gui():
     controller = GuiController(step_delay=0.001)
-    assert controller.state.robot_mode == "SIMULATION"
-    assert controller.ros_worker is None
+    assert controller.state.robot_mode == "REAL ROBOT"
+    assert controller.ros_worker is not None
     assert controller.state.task_status.value == "IDLE"
+    controller.shutdown()
 
 
 def test_message_timeout_statuses():
@@ -31,4 +32,4 @@ def test_ros_worker_error_does_not_break_controller():
     controller.ros_worker = FailedWorker()
     controller.consume_ros_status()
     assert controller.state.ros_status == SystemComponentStatus.ERROR
-    assert controller.state.robot_mode == "SIMULATION"
+    assert controller.state.robot_mode == "REAL ROBOT"

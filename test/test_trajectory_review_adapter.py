@@ -47,6 +47,9 @@ async def _wait_for_request(controller):
 
 def _controller_with_adapter():
     controller = GuiController()
+    # Most adapter tests exercise the existing simulation execution path.
+    # Tests for real-hardware behavior opt in explicitly below.
+    controller.state.robot_mode = "SIMULATION"
     backend = FakeBackend()
     adapter = ExistingTrajectoryReviewAdapter(backend, FakeValidator())
     adapter.run_in_worker = False
@@ -121,5 +124,20 @@ def test_phase9_real_mode_is_disabled_before_trajectory_review():
         await plan_task
         assert controller.state.pending_hitl_request is None
         assert controller.state.task_status == TaskStatus.FAILED
+        assert backend.executed == []
+    asyncio.run(scenario())
+
+
+def test_real_monitoring_mode_can_preview_safe_plan_but_not_approve_execution():
+    async def scenario():
+        controller, backend = _controller_with_adapter()
+        controller.state.robot_mode = "REAL ROBOT"
+        plan_task = controller.request_named_target_trajectory("observe")
+        request = await _wait_for_request(controller)
+        await plan_task
+        assert request.collision_check == "ALLOW"
+        assert not controller.submit_hitl_decision(
+            request.request_id, HitlDecision.APPROVE, real_confirmed=True,
+        )
         assert backend.executed == []
     asyncio.run(scenario())

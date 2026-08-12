@@ -9,14 +9,40 @@ from typing import Callable
 import yaml
 
 
-def load_gui_config() -> dict:
-    """Load gui_config.yaml for source and installed runs."""
+def package_share_directory() -> Path:
+    """Return the installed share directory, with a source-tree fallback."""
     try:
         from ament_index_python.packages import get_package_share_directory
-        config_file = Path(get_package_share_directory("hitl_gui")) / "config" / "gui_config.yaml"
+        return Path(get_package_share_directory("hitl_gui"))
     except Exception:
-        config_file = Path(__file__).resolve().parents[1] / "config" / "gui_config.yaml"
-    return yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+        return Path(__file__).resolve().parents[1]
+
+
+def resolve_package_path(value: str | Path) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else package_share_directory() / path
+
+
+def load_gui_config() -> dict:
+    """Load gui_config.yaml for source and installed runs."""
+    config_file = package_share_directory() / "config" / "gui_config.yaml"
+    config = yaml.safe_load(config_file.read_text(encoding="utf-8")) or {}
+    rviz_path = config.get("rviz_config") or config.get("rviz", {}).get("config_path")
+    if rviz_path:
+        resolved = str(resolve_package_path(rviz_path))
+        config.setdefault("rviz", {})["config_path"] = resolved
+        config["rviz_config"] = resolved
+    embedded_path = config.get("embedded_rviz", {}).get("rviz_config")
+    if embedded_path:
+        config["embedded_rviz"]["rviz_config"] = str(resolve_package_path(embedded_path))
+    timeout = config.get("status_timeout", {})
+    if isinstance(timeout, dict):
+        monitor = config.setdefault("ros_monitor", {})
+        monitor["ready_age_sec"] = float(timeout.get("ready_sec", monitor.get("ready_age_sec", 1.0)))
+        monitor["warning_age_sec"] = float(timeout.get("disconnected_sec", monitor.get("warning_age_sec", 3.0)))
+    if "refresh_rate" in config:
+        config.setdefault("ros_monitor", {})["refresh_hz"] = float(config["refresh_rate"])
+    return config
 
 
 def load_rviz_settings() -> dict:

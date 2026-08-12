@@ -15,6 +15,7 @@ class _PlanningFailureBackend(_Backend):
 
 def _controller(mock_perception=None, backend=None):
     controller = GuiController()
+    controller.state.robot_mode = "SIMULATION"
     config = RuntimeBackendConfig(mock_perception=mock_perception or {})
     adapters = RuntimeAdapterRegistry(config)
     controller.runtime_backend_config = config

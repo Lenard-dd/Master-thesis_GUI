@@ -214,6 +214,7 @@ class GuiSkillRuntimeAdapter:
         except ValueError:
             index = 0
         request.object_id = ids[(index + 1) % len(ids)]
+        self.controller.state.experiment_metrics.target_change_count += 1
         self.controller.append_event("target_candidate_changed", node_id=request.target_id,
                                      metadata={"request_id": request_id, "object_id": request.object_id})
         return True
@@ -308,10 +309,9 @@ class GuiSkillRuntimeAdapter:
                 if parent:
                     parent.status = ToolStatus.FAILED
                     self.controller.register_tool_node(parent, append_legacy=False)
-                self.controller.state.task_status = TaskStatus.FAILED
-                self.controller.add_chat_message(
+                self.controller.fail_task(
                     f"Could not prepare the reviewed grasp motion: {exc}",
-                    sent=False, name="System",
+                    node_id=review_node.node_id,
                 )
                 return
             self._request_gripper_gate(task_id, "open_gripper", "Open Gripper", purpose="prepare")
@@ -328,14 +328,14 @@ class GuiSkillRuntimeAdapter:
                 node.node_id, ToolStatus.FAILED,
                 error_message="Real gripper release is not connected to this GUI runtime yet.",
             )
-            self.controller.state.task_status = TaskStatus.FAILED
+            self.controller.fail_task("Real gripper execution is not enabled.", node_id=node.node_id)
             return
         method = getattr(self._sim_gripper, node.tool_name)
         result = method(**node.input_data)
         if not result.get("success", False):
             self.controller.update_tool_status(node.node_id, ToolStatus.FAILED,
                                                error_message=result.get("message", "Gripper failed."))
-            self.controller.state.task_status = TaskStatus.FAILED
+            self.controller.fail_task(str(result.get("message", "Gripper failed.")), node_id=node.node_id)
             return
         self.controller.update_tool_status(node.node_id, ToolStatus.SUCCEEDED,
                                            output_summary=result.get("output", {}))
@@ -368,7 +368,7 @@ class GuiSkillRuntimeAdapter:
             )
             parent.status = ToolStatus.FAILED
             self.controller.register_tool_node(parent, append_legacy=False)
-            self.controller.state.task_status = TaskStatus.FAILED
+            self.controller.fail_task("Real grasp verification is not enabled.", node_id=node.node_id)
             return
         from llm_skill_robot.grasping.grasp_verifier import GraspVerifier
         verification_success = bool(self.controller.gui_config.get("phase9", {}).get("mock_verification_success", True))
@@ -471,8 +471,10 @@ class GuiSkillRuntimeAdapter:
             if parent:
                 parent.status = ToolStatus.FAILED
                 self.controller.register_tool_node(parent, append_legacy=False)
-            self.controller.state.task_status = TaskStatus.FAILED
-            self.controller.add_chat_message(f"{display_name} requires a reviewed base_link grasp pose.", sent=False, name="System")
+            self.controller.fail_task(
+                f"{display_name} requires a reviewed base_link grasp pose.",
+                node_id=parent.node_id if parent else None,
+            )
             return
         node = self._add_node(parent, skill_id, display_name, {"object_id": context.get("resolved_object_id")})
         self.controller.update_tool_status(node.node_id, ToolStatus.RUNNING)
