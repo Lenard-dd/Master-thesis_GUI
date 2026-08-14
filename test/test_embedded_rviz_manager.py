@@ -124,6 +124,7 @@ def test_embedded_config_enables_camera_pointcloud2_by_default():
     pointcloud = next(item for item in displays if item.get("Class") == "rviz_default_plugins/PointCloud2")
     assert pointcloud["Enabled"] is True
     assert pointcloud["Name"] == "Camera Point Cloud"
+    assert pointcloud["Size (Pixels)"] == 3
     assert pointcloud["Topic"]["Value"] == "/camera/camera/depth/color/points"
     assert pointcloud["Topic"]["Reliability Policy"] == "Best Effort"
 

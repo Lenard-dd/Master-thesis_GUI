@@ -25,6 +25,8 @@ def test_stage10_config_has_canonical_settings_and_resolved_rviz_path():
     assert config["rviz_config"].endswith("config/embedded_robot_only.rviz")
     assert config["enable_real_driver_start"] is True
     assert config["enable_real_execution"] is False
+    camera_arguments = config["system_launcher"]["components"]["camera"]["arguments"]
+    assert "pointcloud.allow_no_texture_points:=true" in camera_arguments
 
 
 def test_launch_ros_arguments_do_not_terminate_gui_argument_parser(monkeypatch):

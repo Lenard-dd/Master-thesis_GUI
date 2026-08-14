@@ -28,7 +28,7 @@ Visualization Manager:
       Name: Camera Point Cloud
       Position Transformer: XYZ
       Selectable: true
-      Size (Pixels): 2
+      Size (Pixels): 3
       Size (m): 0.005
       Style: Points
       Topic:

@@ -93,7 +93,7 @@ system_launcher:
       display_name: "Camera"
       package: realsense2_camera
       launch_file: rs_launch.py
-      arguments: ["enable_rgbd:=true", "enable_sync:=true", "align_depth.enable:=true", "enable_color:=true", "enable_depth:=true", "pointcloud.enable:=true"]
+      arguments: ["enable_rgbd:=true", "enable_sync:=true", "align_depth.enable:=true", "enable_color:=true", "enable_depth:=true", "pointcloud.enable:=true", "pointcloud.allow_no_texture_points:=true"]
       conflict_node_names: ["/camera/camera"]
       timeout_sec: 15
     ur5_fake:
