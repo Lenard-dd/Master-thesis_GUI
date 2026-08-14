@@ -118,9 +118,13 @@ class GuiController:
 
     def build_page(self) -> None:
         ui.colors(primary="#1d4f91", secondary="#546e7a", accent="#1976d2")
-        ui.add_head_html("<style>body { background: #f5f7fa; }</style>")
+        ui.add_head_html(
+            "<style>body { background: #f5f7fa; } "
+            ".q-card { border-radius: 8px; } "
+            ".q-expansion-item { border-radius: 8px; overflow: hidden; }</style>"
+        )
         self.add_welcome_message()
-        with ui.column().classes("w-full min-h-screen gap-4 p-4"):
+        with ui.column().classes("w-full min-h-screen gap-3 p-3"):
             header_renderer = create_header_panel(self)
             renderers = []
             # Keep conversation focused but leave the primary workspace for

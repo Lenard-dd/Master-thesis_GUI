@@ -90,7 +90,7 @@ system_launcher:
   components:
     camera:
       type: ros2_launch
-      display_name: "D435i Camera"
+      display_name: "Camera"
       package: realsense2_camera
       launch_file: rs_launch.py
       arguments: ["enable_rgbd:=true", "enable_sync:=true", "align_depth.enable:=true", "enable_color:=true", "enable_depth:=true", "pointcloud.enable:=true"]
@@ -115,7 +115,7 @@ system_launcher:
       timeout_sec: 20
     gripper:
       type: ros2_launch
-      display_name: "Robotiq Gripper"
+      display_name: "Gripper"
       package: robotiq_gripper_communication
       launch_file: ros_gripper_comm.launch.py
       arguments: []

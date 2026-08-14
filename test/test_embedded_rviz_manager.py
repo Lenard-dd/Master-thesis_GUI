@@ -115,6 +115,19 @@ def test_embedded_only_config_hides_both_rviz_docks():
     assert content.startswith("Panels: []\n")
 
 
+def test_embedded_config_enables_camera_pointcloud2_by_default():
+    import yaml
+
+    config = Path(__file__).resolve().parents[1] / "config" / "embedded_robot_only.rviz"
+    data = yaml.safe_load(config.read_text(encoding="utf-8"))
+    displays = data["Visualization Manager"]["Displays"]
+    pointcloud = next(item for item in displays if item.get("Class") == "rviz_default_plugins/PointCloud2")
+    assert pointcloud["Enabled"] is True
+    assert pointcloud["Name"] == "Camera Point Cloud"
+    assert pointcloud["Topic"]["Value"] == "/camera/camera/depth/color/points"
+    assert pointcloud["Topic"]["Reliability Policy"] == "Best Effort"
+
+
 def test_reload_only_replaces_iframe_content_without_starting_manager(tmp_path):
     from hitl_gui.panels.embedded_rviz_panel import EmbeddedRvizPanel
 
@@ -138,3 +151,19 @@ def test_reload_only_replaces_iframe_content_without_starting_manager(tmp_path):
     assert manager.starts == 0
     assert iframe.updates == 1
     assert "127.0.0.1:6080" in iframe.content
+
+
+def test_running_panel_badge_uses_positive_background_color():
+    from nicegui import ui
+    from hitl_gui.panels.embedded_rviz_panel import EmbeddedRvizPanel
+
+    class Manager:
+        def get_status(self):
+            return {"status": "RUNNING", "running": True, "error": None}
+
+    panel = EmbeddedRvizPanel(Manager(), "http://127.0.0.1:6080/vnc.html")
+    panel._status = ui.badge("STOPPED", color="grey")
+    panel._message = ui.label()
+    panel._refresh()
+    assert panel._status.text == "RUNNING"
+    assert panel._status._props["color"] == "positive"

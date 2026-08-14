@@ -92,7 +92,12 @@ class EmbeddedRvizPanel:
         state = self.manager.get_status()
         status = state["status"]
         self._status.text = status
-        self._status.color = {"RUNNING": "positive", "ERROR": "negative", "STARTING": "warning", "STOPPED": "grey"}[status]
+        # Badge colors are backed by NiceGUI's BackgroundColorElement; setting
+        # an arbitrary ``color`` attribute does not update the Quasar prop.
+        self._status.background_color = {
+            "RUNNING": "positive", "ERROR": "negative",
+            "STARTING": "warning", "STOPPED": "grey",
+        }[status]
         if status == "STARTING":
             self._message.text = "Starting RViz and noVNC..."
         elif status == "ERROR":

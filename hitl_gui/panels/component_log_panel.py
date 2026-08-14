@@ -10,11 +10,13 @@ def create_component_log_panel(controller):
         else:
             expanded_components.discard(component_id)
 
-    @ui.refreshable
-    def content():
-        with ui.card().classes("w-full"):
+    with ui.expansion("Component Process Logs", icon="terminal", value=False).classes(
+        "w-full bg-white border border-grey-3 rounded-lg"
+    ):
+        @ui.refreshable
+        def content():
             with ui.row().classes("w-full items-center justify-between"):
-                ui.label("Component Process Logs").classes("text-lg font-semibold")
+                ui.label("Latest 200 lines per GUI-managed process").classes("text-xs text-grey-7")
                 ui.button("Refresh", icon="refresh", on_click=content.refresh).props("dense flat")
             for component_id, managed in controller.state.component_processes.items():
                 with ui.expansion(
@@ -25,12 +27,15 @@ def create_component_log_panel(controller):
                     ),
                 ):
                     ui.label(f"PID: {managed.pid or '-'}  Started: {managed.start_time or '-'}")
-                    ui.label("\n".join(managed.recent_output[-200:]) or "No captured output.").classes("font-mono text-xs whitespace-pre-wrap")
+                    with ui.scroll_area().classes("w-full h-[280px] max-h-[40vh] bg-grey-10 text-white rounded p-2"):
+                        ui.label("\n".join(managed.recent_output[-200:]) or "No captured output.").classes(
+                            "font-mono text-[11px] whitespace-pre-wrap"
+                        )
                     def clear_display(m=managed):
                         m.recent_output.clear()
                         content.refresh()
                     ui.button("Clear Display", on_click=clear_display).props("outline")
             if not controller.state.component_processes:
                 ui.label("No GUI-managed component process.").classes("text-grey")
-    content()
+        content()
     return content

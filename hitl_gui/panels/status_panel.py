@@ -1,101 +1,155 @@
-"""Stable component controls plus a separately refreshable status view."""
+"""Compact, stable process/ROS-health table with operator controls."""
 
 from nicegui import ui
 
 
 def create_status_panel(controller, *, compact: bool = False):
-    """Create buttons once; refresh only the read-only status content."""
-    card_classes = "w-full p-3" if compact else "w-full h-full min-h-[520px] p-3"
+    """Build controls once and update badges without reconstructing buttons."""
+    process_badges, health_badges, row_elements = {}, {}, {}
+    card_classes = "w-full p-3" if compact else "w-full min-h-[480px] p-3"
+    rows = [
+        ("ur5", "UR5", "UR5"),
+        ("camera", "Camera", "D435i"),
+        ("gripper", "Gripper", "Robotiq 2F-140"),
+        ("graspgenx", "GraspGenX", None),
+        ("rviz", "RViz2", "RViz2"),
+        ("moveit", "MoveIt", "MoveIt"),
+        ("sam3", "SAM3", None),
+    ]
+
     with ui.card().classes(card_classes):
-        ui.label("System Status").classes("text-base font-semibold")
+        with ui.row().classes("w-full items-center justify-between gap-2"):
+            ui.label("System").classes("text-base font-semibold")
+            with ui.row().classes("items-center gap-2"):
+                ui.label(f"{controller.runtime_adapters.mode_summary}").classes("text-[10px] text-grey-6")
+                launcher_label = ui.badge("IDLE", color="grey-7").props("outline").classes("text-[9px]")
+        with ui.element("div").classes(
+            "w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-2"
+        ):
+            for component_id, display_name, _health_name in rows:
+                with ui.element("div").classes(
+                    "w-full min-w-0 px-2 py-1.5 rounded border-l-4 border-grey-4 bg-grey-1"
+                ) as row_element:
+                    row_elements[component_id] = row_element
+                    with ui.row().classes("w-full items-center justify-between gap-1 no-wrap"):
+                        ui.label(display_name).classes("font-medium truncate min-w-0")
+                        _component_actions(controller, component_id)
+                    with ui.row().classes("w-full items-center gap-1 no-wrap mt-0.5"):
+                        process_badges[component_id] = ui.badge("Process · —", color="grey-7").classes("text-[9px]")
+                        if _health_name is not None:
+                            health_badges[component_id] = ui.badge("ROS · UNKNOWN", color="warning").classes("text-[9px]")
 
-        @ui.refreshable
-        def status_view():
-            state = controller.state
-            ur5_processes = [
-                process for component_id, process in state.component_processes.items()
-                if component_id in {"ur5_fake", "ur5_real"}
-            ]
-            ur5_process = next(
-                (process for process in ur5_processes if process.status.value in {"STARTING", "RUNNING", "STOPPING"}),
-                ur5_processes[-1] if ur5_processes else None,
-            )
-            status_classes = (
-                "w-full grid grid-cols-2 md:grid-cols-3 xl:grid-cols-4 gap-x-4 gap-y-1 text-xs"
-                if compact else "w-full gap-1 text-xs"
-            )
-            with ui.element("div").classes(status_classes):
-                _status_line("UR5 Process", ur5_process.status.value if ur5_process else "STOPPED")
-                _status_line("UR5 Health", state.hardware_status["UR5"].value)
-                _status_line("RViz Process", state.rviz_process_status)
-                ui.label(f"Backends: {controller.runtime_adapters.mode_summary}").classes("text-grey text-xs")
-                ui.label(f"Launcher: {state.simulation_launch_status}").classes("text-grey text-xs")
-                if not compact:
-                    ui.separator().classes("my-1")
-                for name, status in [(controller.agent_name, state.agent_status), *state.hardware_status.items()]:
-                    value = state.rviz_process_status if name == "RViz2" else status.value
-                    _status_line(name, value)
+        ui.separator().classes("my-2")
+        with ui.row().classes("w-full items-center justify-end gap-2 flex-wrap"):
+            with ui.row().classes("gap-1 flex-wrap"):
+                ui.button("Start Simulation", icon="play_arrow",
+                          on_click=controller.start_simulation_components).props("dense size=sm")
+                real_system_button = ui.button(
+                    "Start Real System", icon="play_arrow",
+                    on_click=lambda: _real_system_dialog(controller), color="negative",
+                ).props("dense size=sm")
+                if not controller.gui_config.get("enable_real_driver_start", False):
+                    real_system_button.disable()
+                    real_system_button.tooltip("Real driver startup is disabled")
+                ui.button("Stop All", icon="stop",
+                          on_click=controller.stop_gui_managed_components).props("dense size=sm outline")
 
-        status_view()
-        with ui.expansion("Component Controls", icon="settings").classes("w-full text-sm"):
-            _create_stable_controls(controller, compact=compact)
+    def status_view() -> None:
+        state = controller.state
+        process_values = {
+            "ur5": _managed_process_status(state, ("ur5_fake", "ur5_real")),
+            "camera": _managed_process_status(state, ("camera",)),
+            "gripper": _managed_process_status(state, ("gripper",)),
+            "graspgenx": _managed_process_status(state, ("graspgenx",)),
+            "rviz": state.rviz_process_status,
+            "moveit": "UR5 STACK" if _managed_process_status(state, ("ur5_fake", "ur5_real")) == "RUNNING" else "—",
+            "sam3": "EXTERNAL",
+        }
+        for component_id, _display_name, health_name in rows:
+            process_value = process_values[component_id]
+            health_value = state.hardware_status[health_name].value if health_name is not None else None
+            _set_badge(process_badges[component_id], process_value, "Process")
+            if health_name is not None:
+                _set_badge(health_badges[component_id], health_value, "ROS")
+            _set_row_state(row_elements[component_id], process_value, health_value)
+        launcher_value = state.simulation_launch_status
+        launcher_label.text = launcher_value
+        launcher_label.background_color = _status_color(launcher_value)
+        launcher_label.update()
+
+    # GuiController expects renderer.refresh(); keeping it as a stable update
+    # avoids replacing clickable controls at the 5 Hz monitor frequency.
+    status_view.refresh = status_view
+    status_view()
     return status_view
 
 
-def _create_stable_controls(controller, *, compact: bool = False):
-    """These buttons intentionally live outside ui.refreshable."""
-    layout = "w-full grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3" if compact else "w-full gap-1"
-    with ui.element("div").classes(layout):
-        for title, component_id in [
-            ("D435i Camera", "camera"),
-            ("Robotiq 2F-140", "gripper"),
-            ("GraspGenX", "graspgenx"),
-        ]:
-            with ui.column().classes("w-full gap-1"):
-                ui.label(title).classes("text-xs font-medium")
-                with ui.button_group().props("outline"):
-                    ui.button("Start", icon="play_arrow",
-                              on_click=lambda cid=component_id: controller.start_component(cid)).props("dense size=sm")
-                    ui.button("Stop", icon="stop",
-                              on_click=lambda cid=component_id: controller.stop_component(cid)).props("dense size=sm outline")
-
-        with ui.column().classes("w-full gap-1"):
-            ui.label("UR5").classes("text-xs font-medium")
-            with ui.row().classes("w-full gap-2 flex-wrap"):
-                with ui.button_group().props("outline"):
-                    ui.button("Fake", icon="play_arrow",
-                              on_click=lambda: controller.start_component("ur5_fake")).props("dense size=sm")
-                    ui.button("Stop", icon="stop",
-                              on_click=lambda: controller.stop_component("ur5_fake")).props("dense size=sm outline")
-                with ui.button_group().props("outline"):
-                    real_button = ui.button("Real", icon="play_arrow",
-                                            on_click=lambda: _real_dialog(controller)).props("dense size=sm color=negative")
-                    ui.button("Stop", icon="stop",
-                              on_click=lambda: controller.stop_component("ur5_real")).props("dense size=sm outline color=negative")
-                if not controller.gui_config.get("enable_real_driver_start", False):
-                    real_button.disable()
-                    real_button.tooltip("Real driver startup is disabled")
-    ui.separator().classes("my-2")
-    with ui.row().classes("w-full gap-2 flex-wrap"):
-        ui.button("Start Simulation", icon="play_arrow",
-                  on_click=controller.start_simulation_components).props("dense size=sm")
-        real_system_button = ui.button("Start Real System", icon="play_arrow",
-                                       on_click=lambda: _real_system_dialog(controller),
-                                       color="negative").props("dense size=sm")
-        if not controller.gui_config.get("enable_real_driver_start", False):
-            real_system_button.disable()
-            real_system_button.tooltip("Real driver startup is disabled")
-        ui.button("Stop All GUI-Managed", icon="stop",
-                  on_click=controller.stop_gui_managed_components).props("dense size=sm outline")
+def _component_actions(controller, component_id: str) -> None:
+    with ui.row().classes("gap-1 items-center no-wrap"):
+        if component_id == "ur5":
+            ui.button("Fake", on_click=lambda: controller.start_component("ur5_fake")).props("dense flat size=sm")
+            real = ui.button("Real", on_click=lambda: _real_dialog(controller), color="negative").props("dense flat size=sm")
+            if not controller.gui_config.get("enable_real_driver_start", False):
+                real.disable()
+            ui.button(icon="stop", on_click=lambda: (
+                controller.stop_component("ur5_fake"), controller.stop_component("ur5_real")
+            )).props("dense flat round size=sm").tooltip("Stop GUI-managed UR5 driver")
+        elif component_id in {"camera", "gripper", "graspgenx"}:
+            ui.button(icon="play_arrow", on_click=lambda cid=component_id: controller.start_component(cid)).props(
+                "dense flat round size=sm"
+            ).tooltip("Start")
+            ui.button(icon="stop", on_click=lambda cid=component_id: controller.stop_component(cid)).props(
+                "dense flat round size=sm"
+            ).tooltip("Stop")
+        elif component_id == "rviz":
+            ui.label("Embedded panel").classes("text-[10px] text-grey-6")
+        elif component_id == "moveit":
+            ui.label("UR5 stack").classes("text-[10px] text-grey-6")
+        else:
+            ui.label("External").classes("text-[10px] text-grey-6")
 
 
-def _status_line(name: str, value: str) -> None:
-    color = "negative" if value in {"DISCONNECTED", "ERROR"} else (
-        "warning" if value in {"WARNING", "UNKNOWN"} else "primary"
+def _managed_process_status(state, component_ids: tuple[str, ...]) -> str:
+    processes = [state.component_processes[item] for item in component_ids if item in state.component_processes]
+    if not processes:
+        return "STOPPED"
+    active = next((item for item in processes if item.status.value in {"STARTING", "RUNNING", "STOPPING"}), None)
+    return (active or processes[-1]).status.value
+
+
+def _set_badge(badge, value: str, prefix: str) -> None:
+    badge.text = f"{prefix} · {value}"
+    badge.background_color = _status_color(value)
+    badge.update()
+
+
+def _set_row_state(element, process_value: str, health_value: str | None) -> None:
+    base = (
+        "w-full min-w-0 px-2 py-1.5 rounded border-l-4 transition-colors"
     )
-    with ui.row().classes("w-full items-center justify-between gap-1 no-wrap"):
-        ui.label(name).classes("text-xs truncate")
-        ui.badge(value, color=color).props("outline").classes("text-[10px]")
+    if process_value in {"ERROR", "FAILED", "EXITED"} or health_value in {"ERROR", "FAILED"}:
+        state_classes = "border-red-5 bg-red-1"
+    elif health_value in {"READY", "RUNNING", "SUCCEEDED"}:
+        state_classes = "border-green-5 bg-green-1"
+    elif health_value is None and process_value == "RUNNING":
+        # Components without a ROS interface can only be assessed from the
+        # GUI-owned process lifecycle; do not fabricate a ROS health signal.
+        state_classes = "border-green-5 bg-green-1"
+    elif process_value in {"RUNNING", "STARTING", "STOPPING"} or health_value in {"WARNING", "UNKNOWN"}:
+        state_classes = "border-amber-5 bg-amber-1"
+    else:
+        state_classes = "border-grey-4 bg-grey-1"
+    element.classes(replace=f"{base} {state_classes}")
+
+
+def _status_color(value: str) -> str:
+    if value.startswith("FAILED") or value in {"DISCONNECTED", "ERROR", "EXITED"}:
+        return "negative"
+    if value in {"WARNING", "UNKNOWN", "WAITING_APPROVAL", "STARTING", "STOPPING"}:
+        return "warning"
+    if value in {"READY", "RUNNING", "SUCCEEDED", "COMPLETED"}:
+        return "positive"
+    return "grey-7"
 
 
 def _real_dialog(controller):
@@ -124,10 +178,8 @@ def _real_system_dialog(controller):
         ui.label("This starts the real UR5 driver, Embedded RViz, camera, gripper driver, and GraspGenX.")
         ui.label("It does not approve a trajectory or command robot motion.").classes("font-medium")
         with ui.row():
-            ui.button(
-                "Confirm Start All",
-                on_click=lambda: (controller.start_real_components(confirmed=True), dialog.close()),
-                color="negative",
-            )
+            ui.button("Confirm Start All",
+                      on_click=lambda: (controller.start_real_components(confirmed=True), dialog.close()),
+                      color="negative")
             ui.button("Cancel", on_click=dialog.close).props("outline")
     dialog.open()
