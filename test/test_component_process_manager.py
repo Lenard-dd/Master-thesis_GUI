@@ -59,18 +59,119 @@ def test_invalid_external_path_returns_error(tmp_path):
 
 
 def test_simulation_launch_waits_for_ur5_health_before_rviz(monkeypatch):
+    async def direct_call(function, *args, **kwargs):
+        return function(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", direct_call)
+
     async def scenario():
-        controller = GuiController()
+        controller = GuiController(config_overrides={"gui_mode": "MOCK"})
         order = []
         class Result:
             status = ProcessStatus.RUNNING
+        class Embedded:
+            def start(self):
+                order.append("embedded_rviz")
+                return True
+            def get_status(self):
+                return {"status": "RUNNING", "running": True, "error": None}
+            def get_error(self):
+                return None
         controller.start_component = lambda component_id, **_kwargs: order.append(component_id) or Result()
-        controller.start_rviz = lambda: order.append("rviz") or {"status": "RUNNING"}
+        controller.embedded_rviz_manager = Embedded()
         controller.consume_ros_status = lambda: controller.state.hardware_status.__setitem__("UR5", SystemComponentStatus.READY)
         task = controller.start_simulation_components()
         await task
-        assert order == ["ur5_fake", "rviz", "camera", "gripper", "graspgenx"]
+        assert order == ["ur5_fake", "embedded_rviz", "camera", "gripper", "graspgenx"]
         assert controller.state.simulation_launch_status == "COMPLETED"
+    asyncio.run(scenario())
+
+
+def test_real_bundle_requires_confirmation_and_starts_required_components_in_order(monkeypatch):
+    async def direct_call(function, *args, **kwargs):
+        return function(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", direct_call)
+
+    async def scenario():
+        controller = GuiController(config_overrides={"gui_mode": "MOCK"})
+        order = []
+        class Result:
+            status = ProcessStatus.RUNNING
+        class Embedded:
+            def start(self):
+                order.append("embedded_rviz")
+                return True
+            def get_status(self):
+                return {"status": "RUNNING", "running": True, "error": None}
+            def get_error(self):
+                return None
+        controller.start_component = lambda component_id, **_kwargs: order.append(component_id) or Result()
+        controller.embedded_rviz_manager = Embedded()
+        controller.consume_ros_status = lambda: controller.state.hardware_status.__setitem__("UR5", SystemComponentStatus.READY)
+        try:
+            controller.start_real_components()
+            assert False, "confirmation gate was bypassed"
+        except RuntimeError as exc:
+            assert "confirmation" in str(exc).lower()
+        task = controller.start_real_components(confirmed=True)
+        await task
+        assert order == ["ur5_real", "embedded_rviz", "camera", "gripper", "graspgenx"]
+        assert controller.state.simulation_launch_status == "COMPLETED"
+    asyncio.run(scenario())
+
+
+def test_embedded_rviz_running_is_reported_when_native_rviz_is_stopped():
+    controller = GuiController(config_overrides={"gui_mode": "MOCK"})
+    controller.rviz_manager = type("Native", (), {
+        "get_process_status": lambda self: {
+            "status": "STOPPED", "running": False, "error": None,
+        },
+    })()
+    controller.embedded_rviz_manager = type("Embedded", (), {
+        "get_status": lambda self: {
+            "status": "RUNNING", "running": True, "error": None,
+        },
+    })()
+    result = controller.refresh_rviz_status()
+    assert result["source"] == "embedded"
+    assert controller.state.rviz_process_status == "RUNNING"
+    assert controller.state.hardware_status["RViz2"] == SystemComponentStatus.RUNNING
+
+
+def test_stop_gui_managed_stops_components_and_both_rviz_managers(monkeypatch):
+    async def direct_call(function, *args, **kwargs):
+        return function(*args, **kwargs)
+    monkeypatch.setattr(asyncio, "to_thread", direct_call)
+
+    async def scenario():
+        controller = GuiController(config_overrides={"gui_mode": "MOCK"})
+        stopped = []
+        class Result:
+            pid = 10
+            exit_code = 0
+        class Components:
+            processes = {"camera": object(), "gripper": object()}
+            def stop_component(self, component_id):
+                stopped.append(component_id)
+                return Result()
+            def refresh(self):
+                return self.processes
+        class Embedded:
+            def stop(self):
+                stopped.append("embedded_rviz")
+            def get_status(self):
+                return {"status": "STOPPED", "running": False, "error": None}
+        class Native:
+            def stop_rviz(self):
+                stopped.append("native_rviz")
+                return {"status": "STOPPED"}
+            def get_process_status(self):
+                return {"status": "STOPPED", "running": False, "error": None}
+        controller.component_manager = Components()
+        controller.embedded_rviz_manager = Embedded()
+        controller.rviz_manager = Native()
+        await controller._stop_gui_managed_components()
+        assert stopped == ["camera", "gripper", "embedded_rviz", "native_rviz"]
+        assert controller.state.simulation_launch_status == "IDLE"
     asyncio.run(scenario())
 
 

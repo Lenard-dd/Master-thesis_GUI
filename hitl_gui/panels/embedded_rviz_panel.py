@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from html import escape
 from pathlib import Path
 from typing import Any, Callable
@@ -52,15 +53,18 @@ class EmbeddedRvizPanel:
         return self._refresh
 
     def start(self) -> None:
-        self.manager.start()
-        self._refresh()
+        asyncio.create_task(self._run_operation("start"))
 
     def stop(self) -> None:
-        self.manager.stop()
-        self._refresh()
+        asyncio.create_task(self._run_operation("stop"))
 
     def restart(self) -> None:
-        self.manager.restart()
+        asyncio.create_task(self._run_operation("restart"))
+
+    async def _run_operation(self, operation: str) -> None:
+        # Prerequisite checks and orderly process shutdown contain short waits;
+        # keep them out of NiceGUI's event loop so other buttons stay responsive.
+        await asyncio.to_thread(getattr(self.manager, operation))
         self._refresh()
 
     def reload(self) -> None:
@@ -100,8 +104,10 @@ class EmbeddedRvizPanel:
         self._status.update()
         self._message.update()
         if self._iframe is not None:
-            self._iframe.content = self._iframe_html() if status == "RUNNING" else ""
-            self._iframe.update()
+            content = self._iframe_html() if status == "RUNNING" else ""
+            if self._iframe.content != content:
+                self._iframe.content = content
+                self._iframe.update()
 
     def _iframe_html(self) -> str:
         return f'<iframe src="{escape(self.iframe_url, quote=True)}" style="width:100%;height:100%;border:none;display:block"></iframe>'

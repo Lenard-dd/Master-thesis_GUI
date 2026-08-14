@@ -157,6 +157,8 @@ class GuiController:
         # processes. They need periodic updates, but not monitor-frequency UI
         # reconstruction.
         ui.timer(1.0, header_renderer.refresh)
+        # Component logs are rebuilt periodically, but the panel preserves
+        # which component sections the operator has expanded.
         ui.timer(1.0, component_log_renderer.refresh)
         # Async Agent/Tool tasks only mark views dirty. This page-owned timer
         # is the sole event-driven path that creates or refreshes UI elements,
@@ -1428,12 +1430,35 @@ class GuiController:
         return result
 
     def refresh_rviz_status(self) -> dict:
-        result = self.rviz_manager.get_process_status()
+        standalone = self.rviz_manager.get_process_status()
+        embedded = self.embedded_rviz_manager.get_status()
+        # Embedded and native RViz are independent GUI-owned implementations
+        # of the same operator-facing component. Report whichever is active;
+        # a stopped manager must never hide a running one.
+        candidates = [
+            ("embedded", embedded),
+            ("native", standalone),
+        ]
+        priority = {"RUNNING": 3, "STARTING": 2, "ERROR": 1, "STOPPED": 0}
+        source, selected = max(
+            candidates,
+            key=lambda item: priority.get(str(item[1].get("status", "STOPPED")), 0),
+        )
+        result = {
+            **selected,
+            "source": source,
+            "embedded": embedded,
+            "native": standalone,
+        }
         self.state.rviz_process_status = result["status"]
         self.state.rviz_running = result["running"]
-        self.state.hardware_status["RViz2"] = (
-            SystemComponentStatus.RUNNING if result["running"] else SystemComponentStatus.DISCONNECTED
-        )
+        if result["running"]:
+            rviz_health = SystemComponentStatus.RUNNING
+        elif result["status"] == "ERROR":
+            rviz_health = SystemComponentStatus.ERROR
+        else:
+            rviz_health = SystemComponentStatus.DISCONNECTED
+        self.state.hardware_status["RViz2"] = rviz_health
         return result
 
     def request_trajectory_preview(self) -> None:
@@ -1573,9 +1598,72 @@ class GuiController:
             self.append_event("component_start_failed", metadata={"component_id": "ur5_fake", "reason": "ROS health timeout"})
             return
 
-        rviz = self.start_rviz()
-        if rviz["status"] != "RUNNING":
-            self.state.simulation_launch_status = "FAILED: RViz"
+        rviz_started = await asyncio.to_thread(self.embedded_rviz_manager.start)
+        self.refresh_rviz_status()
+        if not rviz_started:
+            self.state.simulation_launch_status = "FAILED: Embedded RViz"
+            self.append_event("component_start_failed", metadata={
+                "component_id": "embedded_rviz",
+                "reason": self.embedded_rviz_manager.get_error() or "startup failed",
+            })
+            return
+        for component_id in ("camera", "gripper", "graspgenx"):
+            managed = self.start_component(component_id)
+            if managed.status.value != "RUNNING":
+                self.state.simulation_launch_status = f"FAILED: {component_id}"
+                return
+        self.state.simulation_launch_status = "COMPLETED"
+
+    def start_real_components(self, *, confirmed: bool = False):
+        """Start the GUI-managed real-driver bundle after one explicit gate.
+
+        This starts drivers and visualization only. It never approves a
+        trajectory or sends a robot motion command.
+        """
+        if not confirmed:
+            raise RuntimeError("Real system confirmation is required.")
+        if not self.gui_config.get("enable_real_driver_start", False):
+            raise RuntimeError("Real UR5 startup is disabled by enable_real_driver_start=false.")
+        if self.state.simulation_launch_status == "RUNNING":
+            return None
+        details = self.real_ur5_launch_details()
+        self.append_event("real_robot_driver_confirmed", metadata={
+            "component_id": "ur5_real",
+            "scope": "required_components",
+            "robot_ip": details["robot_ip"],
+            "ros_domain_id": details["ros_domain_id"],
+            "initiated_by": "gui",
+        })
+        self.state.simulation_launch_status = "RUNNING"
+        return asyncio.create_task(self._start_real_components())
+
+    async def _start_real_components(self):
+        ur5 = self.start_component("ur5_real", confirmed=True)
+        if ur5.status.value != "RUNNING":
+            self.state.simulation_launch_status = "FAILED: UR5 Real process"
+            return
+        timeout = self.gui_config["system_launcher"]["components"]["ur5_real"].get("timeout_sec", 20)
+        deadline = asyncio.get_running_loop().time() + timeout
+        while asyncio.get_running_loop().time() < deadline:
+            self.consume_ros_status()
+            if self.state.hardware_status["UR5"] == SystemComponentStatus.READY:
+                break
+            await asyncio.sleep(0.2)
+        else:
+            self.state.simulation_launch_status = "FAILED: UR5 ROS Health not READY"
+            self.append_event("component_start_failed", metadata={
+                "component_id": "ur5_real", "reason": "ROS health timeout",
+            })
+            return
+
+        rviz_started = await asyncio.to_thread(self.embedded_rviz_manager.start)
+        self.refresh_rviz_status()
+        if not rviz_started:
+            self.state.simulation_launch_status = "FAILED: Embedded RViz"
+            self.append_event("component_start_failed", metadata={
+                "component_id": "embedded_rviz",
+                "reason": self.embedded_rviz_manager.get_error() or "startup failed",
+            })
             return
         for component_id in ("camera", "gripper", "graspgenx"):
             managed = self.start_component(component_id)
@@ -1585,8 +1673,34 @@ class GuiController:
         self.state.simulation_launch_status = "COMPLETED"
 
     def stop_gui_managed_components(self):
-        for component_id in list(self.component_manager.processes):
-            self.stop_component(component_id)
+        return asyncio.create_task(self._stop_gui_managed_components())
+
+    async def _stop_gui_managed_components(self) -> None:
+        """Stop all process groups owned by this GUI without blocking its UI."""
+        component_ids = list(self.component_manager.processes)
+        for component_id in component_ids:
+            self.append_event("component_stop_requested", metadata={
+                "component_id": component_id, "initiated_by": "gui",
+            })
+        results = await asyncio.gather(*(
+            asyncio.to_thread(self.component_manager.stop_component, component_id)
+            for component_id in component_ids
+        ))
+        for component_id, managed in zip(component_ids, results):
+            if managed is not None:
+                self.append_event("component_stopped", metadata={
+                    "component_id": component_id,
+                    "pid": managed.pid,
+                    "exit_code": managed.exit_code,
+                    "initiated_by": "gui",
+                })
+        await asyncio.gather(
+            asyncio.to_thread(self.embedded_rviz_manager.stop),
+            asyncio.to_thread(self.rviz_manager.stop_rviz),
+        )
+        self.refresh_component_processes()
+        self.refresh_rviz_status()
+        self.state.simulation_launch_status = "IDLE"
 
     def set_gui_mode(self, mode: str) -> None:
         mode = mode.upper()

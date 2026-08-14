@@ -75,15 +75,9 @@ def create_hitl_panel(controller):
 
         request_view()
         with ui.row().classes("w-full gap-2 mt-2 flex-wrap"):
-            def launch_rviz():
-                result = controller.start_rviz()
-                ui.notify(result["message"] or result["error"] or f"RViz: {result['status']}",
-                          type="negative" if result["status"] == "ERROR" else "info")
-
-            ui.button("Open RViz", on_click=launch_rviz, color="primary").props("dense")
-            ui.button("Restart", on_click=controller.restart_rviz).props("dense outline")
-            ui.button("Stop RViz", on_click=controller.stop_rviz).props("dense outline")
-            ui.button("Preview", on_click=controller.preview_current_trajectory).props("dense outline")
+            # RViz lifecycle belongs to EmbeddedRvizPanel. HITL only republishes
+            # the currently reviewed trajectory and can never start/stop RViz.
+            ui.button("Preview Again", on_click=controller.preview_current_trajectory).props("dense outline")
 
         @ui.refreshable
         def action_view():

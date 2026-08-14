@@ -53,26 +53,40 @@ def _create_stable_controls(controller, *, compact: bool = False):
         ]:
             with ui.column().classes("w-full gap-1"):
                 ui.label(title).classes("text-xs font-medium")
-                with ui.row().classes("w-full gap-1 flex-wrap"):
-                    ui.button("Start", on_click=lambda cid=component_id: controller.start_component(cid)).props("dense size=sm")
-                    ui.button("Stop", on_click=lambda cid=component_id: controller.stop_component(cid)).props("dense size=sm outline")
-                    ui.button("Restart", on_click=lambda cid=component_id: controller.restart_component(cid)).props("dense size=sm outline")
+                with ui.button_group().props("outline"):
+                    ui.button("Start", icon="play_arrow",
+                              on_click=lambda cid=component_id: controller.start_component(cid)).props("dense size=sm")
+                    ui.button("Stop", icon="stop",
+                              on_click=lambda cid=component_id: controller.stop_component(cid)).props("dense size=sm outline")
 
         with ui.column().classes("w-full gap-1"):
             ui.label("UR5").classes("text-xs font-medium")
-            with ui.row().classes("w-full gap-1 flex-wrap"):
-                ui.button("Start Fake", on_click=lambda: controller.start_component("ur5_fake")).props("dense size=sm")
-                real_button = ui.button("Start Real", on_click=lambda: _real_dialog(controller)).props("dense size=sm color=negative")
+            with ui.row().classes("w-full gap-2 flex-wrap"):
+                with ui.button_group().props("outline"):
+                    ui.button("Fake", icon="play_arrow",
+                              on_click=lambda: controller.start_component("ur5_fake")).props("dense size=sm")
+                    ui.button("Stop", icon="stop",
+                              on_click=lambda: controller.stop_component("ur5_fake")).props("dense size=sm outline")
+                with ui.button_group().props("outline"):
+                    real_button = ui.button("Real", icon="play_arrow",
+                                            on_click=lambda: _real_dialog(controller)).props("dense size=sm color=negative")
+                    ui.button("Stop", icon="stop",
+                              on_click=lambda: controller.stop_component("ur5_real")).props("dense size=sm outline color=negative")
                 if not controller.gui_config.get("enable_real_driver_start", False):
                     real_button.disable()
                     real_button.tooltip("Real driver startup is disabled")
-                ui.button("Stop Fake", on_click=lambda: controller.stop_component("ur5_fake")).props("dense size=sm outline")
-                ui.button("Stop Real", on_click=lambda: controller.stop_component("ur5_real")).props("dense size=sm outline color=negative")
-                ui.button("Restart Fake", on_click=lambda: controller.restart_component("ur5_fake")).props("dense size=sm outline")
-                ui.button("Restart Real", on_click=lambda: _real_restart_dialog(controller)).props("dense size=sm outline color=negative")
-    with ui.column().classes("w-full gap-1 mt-2"):
-        ui.button("Start Simulation", on_click=controller.start_simulation_components).props("dense size=sm")
-        ui.button("Stop GUI-Managed", on_click=controller.stop_gui_managed_components).props("dense size=sm outline")
+    ui.separator().classes("my-2")
+    with ui.row().classes("w-full gap-2 flex-wrap"):
+        ui.button("Start Simulation", icon="play_arrow",
+                  on_click=controller.start_simulation_components).props("dense size=sm")
+        real_system_button = ui.button("Start Real System", icon="play_arrow",
+                                       on_click=lambda: _real_system_dialog(controller),
+                                       color="negative").props("dense size=sm")
+        if not controller.gui_config.get("enable_real_driver_start", False):
+            real_system_button.disable()
+            real_system_button.tooltip("Real driver startup is disabled")
+        ui.button("Stop All GUI-Managed", icon="stop",
+                  on_click=controller.stop_gui_managed_components).props("dense size=sm outline")
 
 
 def _status_line(name: str, value: str) -> None:
@@ -100,16 +114,19 @@ def _real_dialog(controller):
     dialog.open()
 
 
-def _real_restart_dialog(controller):
+def _real_system_dialog(controller):
     details = controller.real_ur5_launch_details()
-    with ui.dialog() as dialog, ui.card():
-        ui.label("RESTART REAL UR5 DRIVER").classes("text-lg font-bold text-negative")
-        ui.label(f"robot_ip: {details['robot_ip']} · ROS_DOMAIN_ID: {details['ros_domain_id']}")
-        ui.label("The GUI-managed real driver process will be stopped and started again.")
+    with ui.dialog() as dialog, ui.card().classes("max-w-lg"):
+        ui.label("START REAL HARDWARE SYSTEM").classes("text-lg font-bold text-negative")
+        ui.label(f"robot_ip: {details['robot_ip']}")
+        ui.label(f"ROS_DOMAIN_ID: {details['ros_domain_id']}")
+        ui.label(f"UR5 health: {controller.state.hardware_status['UR5'].value}")
+        ui.label("This starts the real UR5 driver, Embedded RViz, camera, gripper driver, and GraspGenX.")
+        ui.label("It does not approve a trajectory or command robot motion.").classes("font-medium")
         with ui.row():
             ui.button(
-                "Confirm Restart",
-                on_click=lambda: (controller.restart_component("ur5_real", confirmed=True), dialog.close()),
+                "Confirm Start All",
+                on_click=lambda: (controller.start_real_components(confirmed=True), dialog.close()),
                 color="negative",
             )
             ui.button("Cancel", on_click=dialog.close).props("outline")
