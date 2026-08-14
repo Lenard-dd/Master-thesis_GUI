@@ -28,9 +28,8 @@ Visualization Manager:
       Name: Camera Point Cloud
       Position Transformer: XYZ
       Selectable: true
-      Size (Pixels): 3
-      Size (m): 0.005
-      Style: Points
+      Size (m): 0.01
+      Style: Flat Squares
       Topic:
         Depth: 5
         Durability Policy: Volatile
