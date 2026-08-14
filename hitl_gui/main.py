@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 
 from nicegui import app, ui
 
@@ -18,7 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--perception-enabled", type=_as_bool)
     parser.add_argument("--grasp-enabled", type=_as_bool)
     parser.add_argument("--simulation", type=_as_bool)
-    return parser.parse_args()
+    parser.add_argument("--real-execution-enabled", type=_as_bool)
+    # launch_ros appends ROS remapping arguments to executables. NiceGUI owns
+    # this process while RosWorker owns the actual rclpy node, so the web CLI
+    # accepts its known arguments without failing on launch_ros additions.
+    args, _ros_arguments = parser.parse_known_args()
+    return args
 
 
 def _as_bool(value: str) -> bool:
@@ -38,10 +44,15 @@ def main() -> None:
             "perception_enabled": args.perception_enabled,
             "grasp_enabled": args.grasp_enabled,
             "simulation": args.simulation,
+            "real_execution_enabled": args.real_execution_enabled,
             "gui_mode": args.mode,
         }.items() if value is not None
     }
     controller = GuiController(config_overrides=overrides)
+    # NiceGUI handles normal SIGINT/SIGTERM through on_shutdown. atexit is an
+    # idempotent fallback for ordinary interpreter exits; Linux pdeathsig on
+    # each managed child covers abrupt parent-process disappearance.
+    atexit.register(controller.shutdown)
     app.on_shutdown(controller.shutdown)
     ui.page("/")(controller.build_page)
     ui.run(

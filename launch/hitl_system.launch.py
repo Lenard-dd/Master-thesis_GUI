@@ -20,6 +20,7 @@ def generate_launch_description() -> LaunchDescription:
     perception_enabled = LaunchConfiguration("perception_enabled")
     grasp_enabled = LaunchConfiguration("grasp_enabled")
     simulation = LaunchConfiguration("simulation")
+    real_execution_enabled = LaunchConfiguration("real_execution_enabled")
     gui_host = LaunchConfiguration("gui_host")
     gui_port = LaunchConfiguration("gui_port")
     rviz_config = PathJoinSubstitution([
@@ -33,6 +34,7 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("perception_enabled", default_value="false"),
         DeclareLaunchArgument("grasp_enabled", default_value="false"),
         DeclareLaunchArgument("simulation", default_value="false"),
+        DeclareLaunchArgument("real_execution_enabled", default_value="false"),
         DeclareLaunchArgument("gui_host", default_value="127.0.0.1"),
         DeclareLaunchArgument("gui_port", default_value="8080"),
     ]
@@ -51,6 +53,7 @@ def generate_launch_description() -> LaunchDescription:
             "--perception-enabled", perception_enabled,
             "--grasp-enabled", grasp_enabled,
             "--simulation", simulation,
+            "--real-execution-enabled", real_execution_enabled,
         ],
     )
     rviz = Node(

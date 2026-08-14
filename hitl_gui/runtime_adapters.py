@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from hitl_gui.robot_config import load_grasping_config
+
 
 SENSOR_SKILLS = {
     "detect_object",
@@ -81,12 +83,11 @@ class ExistingRosSensorGraspAdapter:
         )
         from llm_skill_robot.grasping.graspgenx_grasp_planner import GraspGenXGraspPlanner
         from llm_skill_robot.grasping.graspgenx_subprocess_adapter import GraspGenXSubprocessAdapter
-        from llm_skill_robot.ros_nl_rviz_sim_demo import _load_grasping_config
 
         self._config = config
         perception_config = load_perception_config()
         self._perception_pipeline = create_perception_pipeline(node=node, config=perception_config)
-        grasp_document = _load_grasping_config()
+        grasp_document = load_grasping_config()
         grasp_config = grasp_document.get("grasping", grasp_document)
         self._point_cloud_builder = ObjectPointCloudBuilder(grasp_config.get("point_cloud", {}))
         self._grasp_planner = GraspGenXGraspPlanner(

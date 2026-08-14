@@ -49,3 +49,27 @@ def test_agent_task_intent_approval_has_a_gui_request_and_does_not_execute():
     assert controller.state.task_status == TaskStatus.APPROVED_PENDING_EXECUTION
     assert controller.state.tool_nodes[-1].status == ToolStatus.PENDING
     assert controller.state.tool_nodes[-1].output_data["approval"] == "APPROVED"
+
+
+def test_async_events_only_mark_ui_dirty_until_page_timer_flushes():
+    controller = GuiController()
+    calls = []
+
+    class LogRenderer:
+        def refresh(self):
+            calls.append("log")
+
+    controller._event_renderers = [lambda: calls.append("event")]
+    controller._log_renderer = LogRenderer()
+    controller.append_event("agent_response_received")
+
+    # An Agent coroutine may call append_event without a NiceGUI slot. No UI
+    # callback may run until the page-owned timer invokes the flush method.
+    assert calls == []
+    assert controller._event_views_dirty is True
+    assert controller._log_view_dirty is True
+
+    controller._flush_event_views()
+    assert calls == ["log", "event"]
+    assert controller._event_views_dirty is False
+    assert controller._log_view_dirty is False

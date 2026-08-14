@@ -8,9 +8,12 @@ than being planned or executed here.
 from __future__ import annotations
 
 import asyncio
+import copy
 from typing import Any
 
 from hitl_gui.app_state import TaskStatus, ToolNode, ToolStatus
+from hitl_gui.robot_config import load_grasping_config, load_tabletop_safety_config
+from hitl_gui.real_gripper_adapter import RealGripperRuntimeAdapter
 
 
 class GuiSkillRuntimeAdapter:
@@ -25,10 +28,14 @@ class GuiSkillRuntimeAdapter:
         self._last_node_ids: dict[str, str] = {}
         from llm_skill_robot.robot.robotiq_2f140_sim_backend import Robotiq2F140SimBackend
         self._sim_gripper = Robotiq2F140SimBackend()
+        self._real_gripper = RealGripperRuntimeAdapter()
 
     def cancel(self, task_id: str | None) -> None:
         if task_id:
             self._cancelled_task_ids.add(task_id)
+
+    def shutdown(self) -> None:
+        self._real_gripper.shutdown()
 
     async def run_safe_pick_observation(self, parent: ToolNode) -> None:
         """Start at the required observation pose, then wait for its C gate."""
@@ -128,7 +135,9 @@ class GuiSkillRuntimeAdapter:
             self._request_recovery(task_id, "grasp_generation_failed", "Grasp generation failed", ["Retry", "Select Another Target", "Cancel"])
             return
         try:
-            candidates = await self._screen_grasps(_normalise_grasps(context, generated), context)
+            candidates = await self._screen_grasps(
+                _normalise_grasps(context, generated), context
+            )
         except Exception as exc:
             self.controller.add_chat_message(f"Grasp candidate screening failed: {exc}", sent=False, name="System")
             self._mark_latest_failed("generate_grasp_pose", str(exc))
@@ -149,14 +158,25 @@ class GuiSkillRuntimeAdapter:
         if self.adapters.config.grasp_mode != "graspgenx":
             return candidates
         from llm_skill_robot.perception.tf_pose_transformer import TFPoseTransformer
-        from llm_skill_robot.ros_graspgenx_plan_only_demo import (
-            _load_grasping_config, screen_grasp_candidates_for_plan_only,
-        )
+        from llm_skill_robot.ros_graspgenx_plan_only_demo import screen_grasp_candidates_for_plan_only
+        from llm_skill_robot.safety.tabletop_safety import TabletopSafety
 
         adapter = self.controller._ensure_trajectory_adapter()
-        document = _load_grasping_config()
+        document = load_grasping_config()
         grasping = document.get("grasping", document)
-        preview = grasping.get("plan_only_preview", {})
+        preview = copy.deepcopy(grasping.get("plan_only_preview", {}))
+        moveit_config = preview.get("moveit", {}) or {}
+        if str(moveit_config.get("pipeline_id", "")).startswith("pilz"):
+            screening_config = preview.setdefault("candidate_screening", {})
+            screening_config["variants"] = [
+                variant
+                for variant in screening_config.get(
+                    "variants", ["full_pose", "relaxed_orientation"]
+                )
+                if variant != "position_only"
+            ]
+            screening_config["allow_position_only_fallback"] = False
+        tabletop_safety = TabletopSafety.from_config(load_tabletop_safety_config())
         transformer = TFPoseTransformer(self.adapters.ros_node, target_frame="base_link")
         screening = await asyncio.to_thread(
             screen_grasp_candidates_for_plan_only,
@@ -164,10 +184,15 @@ class GuiSkillRuntimeAdapter:
             adapter.backend, adapter.validator,
             float(preview.get("velocity_scale", 0.05)),
             float(preview.get("acceleration_scale", 0.05)),
+            pose_adjuster=tabletop_safety.apply_grasp_contact_backoff,
+            pose_validator=lambda poses: tabletop_safety.validate_grasp_plan(
+                _tabletop_plan_from_poses(poses)
+            ),
         )
         accepted: dict[str, dict[str, Any]] = {}
         pose_map: dict[str, dict[str, Any]] = {}
         kwargs_map: dict[str, dict[str, Any]] = {}
+        safety_map: dict[str, dict[str, Any]] = {}
         for attempt in screening.get("attempts", []):
             candidate = attempt.get("candidate")
             if not isinstance(candidate, dict):
@@ -181,12 +206,37 @@ class GuiSkillRuntimeAdapter:
                 "collision_result": attempt.get("validation", {}).get("decision", "UNKNOWN"),
                 "orientation_change": attempt.get("variant"),
             })
+            tabletop_result = attempt.get("tabletop_safety", {})
+            if isinstance(tabletop_result, dict):
+                candidate.update({
+                    "tabletop_safety": "ALLOW" if tabletop_result.get("allowed") else "BLOCK",
+                    "tabletop_min_clearance_m": _minimum_tabletop_clearance(tabletop_result),
+                    "grasp_contact_backoff_m": tabletop_safety.grasp_contact_backoff_m,
+                    "finger_close_sweep_m": tabletop_safety.finger_axial_close_sweep_m,
+                })
             if attempt.get("accepted") and candidate_id not in accepted:
                 accepted[candidate_id] = candidate
                 pose_map[candidate_id] = attempt.get("poses", {})
                 kwargs_map[candidate_id] = attempt.get("plan_kwargs", {})
+                safety_map[candidate_id] = tabletop_result
         context["candidate_motion_poses"] = pose_map
         context["candidate_plan_kwargs"] = kwargs_map
+        context["candidate_tabletop_safety"] = safety_map
+        context["tabletop_safety_policy"] = {
+            "enabled": tabletop_safety.enabled,
+            "frame": tabletop_safety.frame,
+            "grasp_contact_backoff_m": tabletop_safety.grasp_contact_backoff_m,
+            "finger_axial_close_sweep_m": tabletop_safety.finger_axial_close_sweep_m,
+        }
+        self.controller.append_event(
+            "tabletop_safety_screening_completed",
+            node_id=self._last_node_ids.get(str(context.get("task_id", ""))),
+            metadata={
+                **context["tabletop_safety_policy"],
+                "candidate_count": len(candidates),
+                "accepted_count": len(accepted),
+            },
+        )
         return sorted(accepted.values(), key=lambda item: float(item.get("score", 0.0)), reverse=True)
 
     def select_target(self, request_id: str, object_id: str) -> bool:
@@ -314,31 +364,57 @@ class GuiSkillRuntimeAdapter:
                     node_id=review_node.node_id,
                 )
                 return
-            self._request_gripper_gate(task_id, "open_gripper", "Open Gripper", purpose="prepare")
+            self._request_gripper_gate(
+                task_id, "open_gripper", "Open Gripper", purpose="prepare"
+            )
 
     async def execute_gripper_after_release(self, node: ToolNode) -> None:
         task_id = self.controller.state.current_task_id
         if not task_id or task_id in self._cancelled_task_ids:
             return
-        # Real contact commands remain deliberately outside this GUI adapter.
-        # The existing real backend requires its own configured driver and
-        # explicit confirmation path; no guessed driver command is sent here.
         if self.controller.state.robot_mode in {"REAL", "REAL ROBOT"}:
-            self.controller.update_tool_status(
-                node.node_id, ToolStatus.FAILED,
-                error_message="Real gripper release is not connected to this GUI runtime yet.",
+            confirmed = self.controller.consume_real_gripper_confirmation(node.node_id)
+            result = await asyncio.to_thread(
+                self._real_gripper.execute,
+                node.tool_name,
+                node.input_data,
+                confirmed=confirmed,
+                contact_confirmation=(
+                    self.controller.real_confirmation_phrase("execution")
+                    if node.tool_name == "close_gripper" else None
+                ),
             )
-            self.controller.fail_task("Real gripper execution is not enabled.", node_id=node.node_id)
-            return
-        method = getattr(self._sim_gripper, node.tool_name)
-        result = method(**node.input_data)
+        else:
+            method = getattr(self._sim_gripper, node.tool_name)
+            result = method(**node.input_data)
         if not result.get("success", False):
+            self.controller.append_event(
+                "real_gripper_command_failed" if self.controller.state.robot_mode in {"REAL", "REAL ROBOT"} else "sim_gripper_command_failed",
+                node_id=node.node_id,
+                metadata={
+                    "skill_id": node.tool_name,
+                    "status": result.get("status"),
+                    "message": result.get("message"),
+                    "command_sent": result.get("output", {}).get("command_sent", False),
+                },
+            )
             self.controller.update_tool_status(node.node_id, ToolStatus.FAILED,
                                                error_message=result.get("message", "Gripper failed."))
             self.controller.fail_task(str(result.get("message", "Gripper failed.")), node_id=node.node_id)
             return
         self.controller.update_tool_status(node.node_id, ToolStatus.SUCCEEDED,
                                            output_summary=result.get("output", {}))
+        self.controller.append_event(
+            "real_gripper_command_succeeded" if self.controller.state.robot_mode in {"REAL", "REAL ROBOT"} else "sim_gripper_command_succeeded",
+            node_id=node.node_id,
+            metadata={
+                "skill_id": node.tool_name,
+                "command_sent": result.get("output", {}).get("command_sent", False),
+                "status": result.get("status"),
+            },
+        )
+        if node.tool_name == "close_gripper":
+            self._contexts.get(task_id, {})["last_gripper_result"] = result
         if node.tool_name == "open_gripper" and node.input_data.get("purpose") == "release":
             parent = self._parent(task_id)
             if parent:
@@ -362,13 +438,50 @@ class GuiSkillRuntimeAdapter:
         )
         self.controller.update_tool_status(node.node_id, ToolStatus.RUNNING)
         if self.controller.state.robot_mode in {"REAL", "REAL ROBOT"}:
-            self.controller.update_tool_status(
-                node.node_id, ToolStatus.FAILED,
-                error_message="Real grasp verification is not connected to this GUI runtime yet.",
+            gripper_result = context.get("last_gripper_result", {})
+            gripper_output = (
+                gripper_result.get("output", {})
+                if isinstance(gripper_result, dict)
+                else {}
             )
-            parent.status = ToolStatus.FAILED
-            self.controller.register_tool_node(parent, append_legacy=False)
-            self.controller.fail_task("Real grasp verification is not enabled.", node_id=node.node_id)
+            object_may_be_held = gripper_output.get("object_may_be_held")
+            contact_detected = bool(
+                gripper_output.get("object_contact_detected", False)
+            )
+            verification_success = contact_detected or object_may_be_held is True
+            self.controller.update_tool_status(
+                node.node_id,
+                ToolStatus.SUCCEEDED if verification_success else ToolStatus.FAILED,
+                output_summary={
+                    "verification": "real_gripper_contact_feedback",
+                    "success": verification_success,
+                    "object_contact_detected": contact_detected,
+                    "object_may_be_held": object_may_be_held,
+                    "current_width_m": gripper_output.get("current_width_m"),
+                    "error_code": gripper_output.get("error_code"),
+                },
+                error_message=(
+                    None
+                    if verification_success
+                    else "Real gripper feedback did not confirm that an object is held."
+                ),
+            )
+            if not verification_success:
+                self._request_recovery(
+                    task_id,
+                    "grasp_verification_failed",
+                    "Real gripper feedback did not confirm that an object is held.",
+                    ["Retry", "Select Another Grasp", "Cancel"],
+                )
+                return
+            target = str(
+                self.controller.gui_config.get("phase9", {}).get(
+                    "place_named_target", "home"
+                )
+            )
+            self._request_named_motion(
+                parent, target, "Move To Place", purpose="place"
+            )
             return
         from llm_skill_robot.grasping.grasp_verifier import GraspVerifier
         verification_success = bool(self.controller.gui_config.get("phase9", {}).get("mock_verification_success", True))
@@ -497,11 +610,11 @@ class GuiSkillRuntimeAdapter:
         from dataclasses import replace
 
         from llm_skill_robot.core.grasp_motion_policy import GraspMotionPolicy
-        from llm_skill_robot.ros_nl_rviz_sim_demo import _load_grasping_config
         from llm_skill_robot.safety.real_arm_safety import load_real_arm_safety
+        from llm_skill_robot.safety.tabletop_safety import TabletopSafety
 
         context = self._contexts[task_id]
-        document = _load_grasping_config()
+        document = load_grasping_config()
         grasping = document.get("grasping", document)
         safety = load_real_arm_safety()
         context["grasp_motion_policy"] = GraspMotionPolicy.from_grasping_config(
@@ -526,6 +639,15 @@ class GuiSkillRuntimeAdapter:
         candidate_id = _candidate_id(candidate) if isinstance(candidate, dict) else None
         screened_poses = context.get("candidate_motion_poses", {}).get(candidate_id)
         if isinstance(screened_poses, dict):
+            tabletop_safety = TabletopSafety.from_config(load_tabletop_safety_config())
+            tabletop_result = tabletop_safety.validate_grasp_plan(
+                _tabletop_plan_from_poses(screened_poses)
+            )
+            if not tabletop_result.get("allowed", False):
+                raise ValueError(
+                    tabletop_result.get("reason", "Reviewed grasp failed tabletop safety validation.")
+                )
+            context["selected_tabletop_safety"] = tabletop_result
             context["grasp_motion_poses"] = screened_poses
             return
         point_cloud = context.get("point_cloud")
@@ -535,13 +657,24 @@ class GuiSkillRuntimeAdapter:
         from llm_skill_robot.ros_graspgenx_plan_only_demo import prepare_candidate_preview
 
         transformer = TFPoseTransformer(self.adapters.ros_node, target_frame="base_link")
-        context["grasp_motion_poses"] = prepare_candidate_preview(
+        poses = prepare_candidate_preview(
             candidate,
             point_cloud,
             grasping.get("plan_only_preview", {}),
             "base_link",
             transformer,
         )
+        tabletop_safety = TabletopSafety.from_config(load_tabletop_safety_config())
+        poses = tabletop_safety.apply_grasp_contact_backoff(poses)
+        tabletop_result = tabletop_safety.validate_grasp_plan(
+            _tabletop_plan_from_poses(poses)
+        )
+        if not tabletop_result.get("allowed", False):
+            raise ValueError(
+                tabletop_result.get("reason", "Reviewed grasp failed tabletop safety validation.")
+            )
+        context["selected_tabletop_safety"] = tabletop_result
+        context["grasp_motion_poses"] = poses
 
     def _add_node(self, parent: ToolNode, skill_id: str, display_name: str, parameters: dict[str, Any]) -> ToolNode:
         task_id = self.controller.state.current_task_id
@@ -573,10 +706,17 @@ class GuiSkillRuntimeAdapter:
 
     def _invalidate_downstream(self, task_id: str, reason: str) -> None:
         context = self._contexts.get(task_id, {})
-        context.pop("point_cloud", None)
-        context.pop("grasp_candidates", None)
-        context.pop("selected_grasp_candidate", None)
-        context.pop("grasp_motion_poses", None)
+        for key in (
+            "point_cloud",
+            "grasp_candidates",
+            "selected_grasp_candidate",
+            "grasp_motion_poses",
+            "candidate_motion_poses",
+            "candidate_plan_kwargs",
+            "candidate_tabletop_safety",
+            "selected_tabletop_safety",
+        ):
+            context.pop(key, None)
         self.controller.invalidate_lineage(reason)
 
     def _parent(self, task_id: str) -> ToolNode | None:
@@ -601,6 +741,28 @@ def _normalise_grasps(context: dict[str, Any], output: dict[str, Any]) -> list[d
 def _candidate_id(candidate: dict[str, Any]) -> str | None:
     value = candidate.get("grasp_candidate_id") or candidate.get("candidate_id") or candidate.get("id")
     return str(value) if value is not None else None
+
+
+def _tabletop_plan_from_poses(poses: dict[str, Any]) -> dict[str, Any]:
+    """Adapt GUI pose names to the shared TabletopSafety plan contract."""
+    return {
+        "pregrasp_pose": poses.get("pregrasp"),
+        "grasp_pose": poses.get("grasp"),
+        "retreat_pose": poses.get("retreat"),
+    }
+
+
+def _minimum_tabletop_clearance(result: dict[str, Any]) -> float | None:
+    """Return the smallest measured contact/sweep clearance for HITL display."""
+    checks = result.get("checks", {})
+    if not isinstance(checks, dict):
+        return None
+    clearances = [
+        float(check["measured_clearance_m"])
+        for check in checks.values()
+        if isinstance(check, dict) and check.get("measured_clearance_m") is not None
+    ]
+    return min(clearances) if clearances else None
 
 
 def _new_plan_step(step_id: str, skill_id: str, description: str, parameters: dict[str, Any]):

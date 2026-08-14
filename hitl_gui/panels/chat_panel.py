@@ -8,7 +8,7 @@ def create_chat_panel(controller):
         # Keep the actual scroll container outside the refreshable region.
         # Re-creating the container on every UI refresh resets its position to
         # the top, which makes it impossible to read the newest messages.
-        rendered = {"message_count": -1}
+        rendered = {"message_count": -1, "scroll_requested": False}
         with ui.scroll_area().classes("w-full flex-grow h-[330px]") as message_scroll:
 
             @ui.refreshable
@@ -20,18 +20,21 @@ def create_chat_panel(controller):
                     for entry in controller.state.conversation:
                         ui.chat_message(entry.text, name=entry.name, sent=entry.sent)
 
-                # Wait until NiceGUI applies the refreshed DOM, then scroll only
-                # when a new message arrived. This preserves manual scrolling
-                # through older conversation history during periodic refreshes.
+                # Never create timers from inside a refreshable function: this
+                # function may be requested by an async Agent task. A stable,
+                # page-owned timer below consumes this flag instead.
                 if rendered["message_count"] != message_count:
                     rendered["message_count"] = message_count
-                    ui.timer(
-                        0.05,
-                        lambda: message_scroll.scroll_to(percent=1.0),
-                        once=True,
-                    )
+                    rendered["scroll_requested"] = True
 
             messages_view()
+
+        def flush_scroll() -> None:
+            if rendered["scroll_requested"]:
+                rendered["scroll_requested"] = False
+                message_scroll.scroll_to(percent=1.0)
+
+        ui.timer(0.1, flush_scroll)
         task_input = ui.input(placeholder="Enter a robot task").classes("w-full")
 
         def send_message():

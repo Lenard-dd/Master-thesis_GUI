@@ -58,6 +58,15 @@ def create_hitl_panel(controller):
                         f"approach {candidate.get('approach_distance', '-')} · joint margin {candidate.get('joint_margin', '-')} · "
                         f"orientation change {candidate.get('orientation_change', '-')}"
                     ).classes("text-xs text-grey")
+                    if candidate.get("tabletop_safety") is not None:
+                        clearance = candidate.get("tabletop_min_clearance_m")
+                        clearance_text = f"{float(clearance) * 1000.0:.1f} mm" if clearance is not None else "-"
+                        backoff = candidate.get("grasp_contact_backoff_m")
+                        backoff_text = f"{float(backoff) * 1000.0:.1f} mm" if backoff is not None else "-"
+                        ui.label(
+                            f"Tabletop {candidate.get('tabletop_safety')} · minimum clearance {clearance_text} · "
+                            f"contact backoff {backoff_text}"
+                        ).classes("text-xs text-grey")
                 elif request.request_type == "error_recovery":
                     ui.badge(request.error_type or "error", color="negative")
                     ui.label(request.description).classes("text-sm text-grey")
@@ -120,16 +129,55 @@ def create_hitl_panel(controller):
 
 def _approve(controller, submit) -> None:
     request = controller.state.pending_hitl_request
-    if request and request.request_type == "trajectory_review" and controller.state.robot_mode in {"REAL", "REAL ROBOT"}:
+    real_command_gate = request and request.request_type in {"trajectory_review", "execution"}
+    if real_command_gate and controller.state.robot_mode in {"REAL", "REAL ROBOT"}:
+        if (
+            request.request_type == "trajectory_review"
+            and controller.gui_config.get("real_execution", {}).get(
+                "arm_approve_is_confirmation", False
+            )
+        ):
+            accepted = controller.submit_hitl_decision(
+                request.request_id, HitlDecision.APPROVE,
+            )
+            if not accepted:
+                ui.notify(
+                    controller.last_decision_error or "Real trajectory approval was rejected.",
+                    type="negative",
+                )
+            return
+        expected_phrase = controller.real_confirmation_phrase(request.request_type)
         with ui.dialog() as dialog, ui.card():
-            ui.label("REAL ROBOT EXECUTION CONFIRMATION").classes("text-lg font-bold text-negative")
-            ui.label(f"Trajectory ID: {request.trajectory_id}")
-            ui.label("This will request real robot motion after all backend safety checks pass.")
+            title = "REAL GRIPPER CONFIRMATION" if request.request_type == "execution" else "REAL ROBOT EXECUTION CONFIRMATION"
+            ui.label(title).classes("text-lg font-bold text-negative")
+            if request.request_type == "trajectory_review":
+                ui.label(f"Trajectory ID: {request.trajectory_id}")
+                ui.label(f"Plan Version: {request.plan_version}")
+                ui.label("This will execute this exact cached trajectory on the real UR5 after health and safety checks pass.")
+            else:
+                ui.label(request.title)
+                ui.label("This will send one approved command to the real Robotiq gripper.")
+            ui.label(f"Type {expected_phrase} to continue.").classes("font-medium text-negative")
+            confirmation = ui.input("Confirmation phrase").props("outlined autocomplete=off").classes("w-full")
+
+            def confirm() -> None:
+                current = controller.state.pending_hitl_request
+                accepted = bool(current) and controller.submit_hitl_decision(
+                    current.request_id, HitlDecision.APPROVE,
+                    confirmation_phrase=str(confirmation.value or ""),
+                )
+                if accepted:
+                    dialog.close()
+                else:
+                    ui.notify(
+                        controller.last_decision_error
+                        or "Confirmation rejected or real-system preflight failed.",
+                        type="negative",
+                    )
             with ui.row():
                 ui.button(
                     "Confirm Execute",
-                    on_click=lambda: (controller.submit_hitl_decision(
-                        request.request_id, HitlDecision.APPROVE, real_confirmed=True), dialog.close()),
+                    on_click=confirm,
                     color="negative",
                 )
                 ui.button("Cancel", on_click=dialog.close).props("outline")

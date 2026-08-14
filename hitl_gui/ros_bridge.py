@@ -43,8 +43,10 @@ class RosBridge:
         if self.node is None:
             return
         try:
+            nodes = self.node.get_node_names_and_namespaces()
             self._update(
-                node_names=[name for name, _namespace in self.node.get_node_names_and_namespaces()],
+                node_names=[name for name, _namespace in nodes],
+                node_fqns=[self._node_fqn(name, namespace) for name, namespace in nodes],
                 service_names=[name for name, _types in self.node.get_service_names_and_types()],
             )
         except Exception as exc:
@@ -53,3 +55,8 @@ class RosBridge:
     def _update(self, **values) -> None:
         with self._lock:
             self._data.update(values)
+
+    @staticmethod
+    def _node_fqn(name: str, namespace: str) -> str:
+        prefix = namespace.rstrip("/")
+        return f"{prefix}/{name}" if prefix else f"/{name}"

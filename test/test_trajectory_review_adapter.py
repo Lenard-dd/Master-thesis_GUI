@@ -1,7 +1,7 @@
 import asyncio
 
-from hitl_gui.app_state import HitlDecision, TaskStatus
-from hitl_gui.gui_controller import GuiController
+from hitl_gui.app_state import HitlDecision, SystemComponentStatus, TaskStatus
+from hitl_gui.gui_controller import GuiController, _planning_failure_reason
 from hitl_gui.trajectory_review_adapter import ExistingTrajectoryReviewAdapter
 
 
@@ -72,6 +72,29 @@ def test_named_target_uses_the_configured_simulation_timing_scales():
     }]
 
 
+def test_planning_failure_reason_exposes_moveit_and_validator_diagnostics():
+    record = type("Record", (), {
+        "summary": {
+            "success": False,
+            "message": "MoveIt pose planning failed: GOAL_IN_COLLISION (-12).",
+            "trajectory_preview": {"moveit_diagnostics": {
+                "error_code_name": "GOAL_IN_COLLISION",
+                "error_code_value": -12,
+            }},
+        },
+        "validation_result": {
+            "decision": "BLOCK",
+            "reasons": ["Trajectory contains no executable points."],
+        },
+    })()
+
+    reason = _planning_failure_reason(record, "generic")
+
+    assert "GOAL_IN_COLLISION" in reason
+    assert "Trajectory contains no executable points" in reason
+    assert reason != "generic"
+
+
 def test_old_request_cannot_approve_after_replan_and_old_trajectory_cannot_execute():
     async def scenario():
         controller, backend = _controller_with_adapter()
@@ -140,4 +163,29 @@ def test_real_monitoring_mode_can_preview_safe_plan_but_not_approve_execution():
             request.request_id, HitlDecision.APPROVE, real_confirmed=True,
         )
         assert backend.executed == []
+    asyncio.run(scenario())
+
+
+def test_real_arm_approve_is_final_confirmation_but_still_requires_ready_health():
+    async def scenario():
+        controller, backend = _controller_with_adapter()
+        controller.state.robot_mode = "REAL ROBOT"
+        controller.gui_config["enable_real_execution"] = True
+        plan_task = controller.request_named_target_trajectory("observe")
+        request = await _wait_for_request(controller)
+        await plan_task
+
+        assert not controller.submit_hitl_decision(
+            request.request_id, HitlDecision.APPROVE,
+        )
+        assert "ROS status" in controller.last_decision_error
+        controller.state.ros_status = SystemComponentStatus.RUNNING
+        controller.state.hardware_status["UR5"] = SystemComponentStatus.READY
+        controller.state.hardware_status["MoveIt"] = SystemComponentStatus.READY
+        assert controller.submit_hitl_decision(
+            request.request_id, HitlDecision.APPROVE,
+        )
+        await controller._last_execution_task
+        assert backend.executed == [request.trajectory_id]
+
     asyncio.run(scenario())

@@ -70,11 +70,17 @@ class GuiController:
         # created during controller construction, before a panel exists.
         self._log_renderer = None
         self._event_renderers = []
+        self._event_views_dirty = False
+        self._log_view_dirty = False
         self.trajectory_adapter = None
         self._invalidated_trajectory_ids: set[str] = set()
         self._last_trajectory_task = None
         self._last_execution_task = None
         self._last_skill_task = None
+        self._real_gripper_confirmed_nodes: set[str] = set()
+        self.last_decision_error: str | None = None
+        self._last_ros_worker_error: str | None = None
+        self._shutdown_complete = False
         self.state = AppState(hardware_status={
             "ROS 2": SystemComponentStatus.IDLE,
             "UR5": SystemComponentStatus.DISCONNECTED,
@@ -100,7 +106,10 @@ class GuiController:
         )
         self.embedded_rviz_manager = EmbeddedRvizManager(self.gui_config.get("embedded_rviz", {}))
         self.ros_worker: RosWorker | None = None
-        self.component_manager = ComponentProcessManager(self.gui_config.get("system_launcher", {}))
+        self.component_manager = ComponentProcessManager(
+            self.gui_config.get("system_launcher", {}),
+            conflict_checker=self._component_conflict_reason,
+        )
         self.runtime_backend_config = RuntimeBackendConfig.from_gui_config(self.gui_config)
         self.runtime_adapters = RuntimeAdapterRegistry(self.runtime_backend_config)
         self.skill_runtime = GuiSkillRuntimeAdapter(self, self.runtime_adapters)
@@ -149,6 +158,10 @@ class GuiController:
         # reconstruction.
         ui.timer(1.0, header_renderer.refresh)
         ui.timer(1.0, component_log_renderer.refresh)
+        # Async Agent/Tool tasks only mark views dirty. This page-owned timer
+        # is the sole event-driven path that creates or refreshes UI elements,
+        # so NiceGUI always has a valid client slot/container context.
+        ui.timer(0.1, self._flush_event_views)
         refresh_hz = self.gui_config.get("refresh_rate", self.gui_config.get("ros_monitor", {}).get("refresh_hz", 5))
         ui.timer(1.0 / max(1, refresh_hz), lambda: self._refresh_ui(renderers))
 
@@ -169,6 +182,8 @@ class GuiController:
             self.gui_config["robot_mode"] = "SIMULATION" if simulation else "REAL ROBOT"
             if simulation:
                 self.gui_config["enable_real_execution"] = False
+        if "real_execution_enabled" in overrides:
+            self.gui_config["enable_real_execution"] = bool(overrides["real_execution_enabled"])
         if "gui_mode" in overrides:
             self.gui_config["gui_mode"] = str(overrides["gui_mode"]).upper()
 
@@ -684,7 +699,9 @@ class GuiController:
             return
         self._apply_real_motion_safety(record)
         if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
-            reason = "MoveIt returned no executable trajectory or validation blocked it."
+            reason = _planning_failure_reason(
+                record, "MoveIt returned no executable trajectory or validation blocked it."
+            )
             self.state.task_status = TaskStatus.FAILED
             if source_node_id:
                 self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=reason,
@@ -738,7 +755,10 @@ class GuiController:
             return
         self._apply_real_motion_safety(record)
         if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
-            reason = "MoveIt returned no executable pose trajectory or validation blocked it."
+            reason = _planning_failure_reason(
+                record,
+                "MoveIt returned no executable pose trajectory or validation blocked it.",
+            )
             self.state.task_status = TaskStatus.FAILED
             if source_node_id:
                 self.update_tool_status(source_node_id, ToolStatus.FAILED, error_message=reason,
@@ -899,12 +919,58 @@ class GuiController:
         )
         return request
 
-    def submit_hitl_decision(self, request_id: str, decision: HitlDecision, *, real_confirmed: bool = False) -> bool:
+    def submit_hitl_decision(
+        self, request_id: str, decision: HitlDecision, *,
+        real_confirmed: bool = False, confirmation_phrase: str | None = None,
+    ) -> bool:
+        self.last_decision_error = None
         request = self.state.pending_hitl_request
         if request is None or request.status != "PENDING":
+            self.last_decision_error = "No current pending HITL request is available."
             return False
         if request.request_id != request_id or request.task_id != self.state.current_task_id:
+            self.last_decision_error = "The approval does not belong to the current task/request."
             return False
+        real_robot = self.state.robot_mode in {"REAL", "REAL ROBOT"}
+        real_command_gate = request.request_type in {"trajectory_review", "execution"}
+        if decision == HitlDecision.APPROVE and real_robot and real_command_gate:
+            if not self.gui_config.get("enable_real_execution", False):
+                self.last_decision_error = (
+                    "Real execution is disabled for this GUI session. Start with "
+                    "real_execution_enabled:=true only after the work area is safe."
+                )
+                self.append_event(
+                    "real_execution_blocked", node_id=request.target_id,
+                    metadata={"request_id": request.request_id, "reason": "enable_real_execution=false"},
+                )
+                return False
+            approve_is_confirmation = (
+                request.request_type == "trajectory_review"
+                and self.gui_config.get("real_execution", {}).get(
+                    "arm_approve_is_confirmation", False
+                )
+            )
+            expected_phrase = self.real_confirmation_phrase(request.request_type)
+            if not approve_is_confirmation and confirmation_phrase != expected_phrase:
+                self.last_decision_error = f"Exact {expected_phrase} confirmation is required."
+                self.append_event(
+                    "real_execution_confirmation_rejected", node_id=request.target_id,
+                    metadata={"request_id": request.request_id, "request_type": request.request_type},
+                )
+                return False
+            if request.request_type == "trajectory_review":
+                ready, reason = self.real_motion_preflight()
+                if not ready:
+                    self.last_decision_error = reason
+                    self.add_chat_message(reason, sent=False, name="System")
+                    self.append_event(
+                        "real_execution_preflight_failed", node_id=request.target_id,
+                        metadata={"request_id": request.request_id, "reason": reason},
+                    )
+                    return False
+            else:
+                self._real_gripper_confirmed_nodes.add(request.target_id)
+            real_confirmed = True
         if request.request_type != "trajectory_review":
             if request.request_type == "grasp_review":
                 if decision == HitlDecision.APPROVE:
@@ -914,19 +980,18 @@ class GuiController:
                     self.cancel_task()
                     return True
             return self._submit_agent_hitl_decision(request, decision)
-        if (decision == HitlDecision.APPROVE
-                and not self.gui_config.get("enable_real_execution", False)
-                and self.state.robot_mode in {"REAL", "REAL ROBOT"}):
-            return False
         if request.plan_version != self.state.current_plan_version:
+            self.last_decision_error = "The request plan version is no longer current."
             return False
         if request.trajectory_id != self.state.current_trajectory_id:
+            self.last_decision_error = "The request trajectory is no longer the current trajectory."
             return False
         if request.trajectory_id in self._invalidated_trajectory_ids:
+            self.last_decision_error = "This trajectory was invalidated and cannot be executed."
             return False
         if (
             decision == HitlDecision.APPROVE
-            and self.state.robot_mode in {"REAL", "REAL ROBOT"}
+            and real_robot
             and not real_confirmed
         ):
             return False
@@ -952,6 +1017,34 @@ class GuiController:
             return True
         self.state.pending_hitl_request = None
         self.runner.submit_decision(decision)
+        return True
+
+    def real_confirmation_phrase(self, request_type: str) -> str:
+        settings = self.gui_config.get("real_execution", {})
+        key = "gripper_confirmation_phrase" if request_type == "execution" else "arm_confirmation_phrase"
+        fallback = "YES" if request_type == "execution" else "EXECUTE"
+        return str(settings.get(key, fallback))
+
+    def real_motion_preflight(self) -> tuple[bool, str]:
+        """Fail closed unless the live ROS graph reports a usable arm and MoveIt."""
+        settings = self.gui_config.get("real_execution", {})
+        if not settings.get("require_ros_health_ready", True):
+            return True, "Real motion health preflight is disabled by configuration."
+        if self.state.ros_status != SystemComponentStatus.RUNNING:
+            return False, f"Real execution blocked: ROS status is {self.state.ros_status.value}."
+        ur5 = self.state.hardware_status.get("UR5", SystemComponentStatus.DISCONNECTED)
+        moveit = self.state.hardware_status.get("MoveIt", SystemComponentStatus.DISCONNECTED)
+        if ur5 not in {SystemComponentStatus.READY, SystemComponentStatus.RUNNING}:
+            return False, f"Real execution blocked: UR5 ROS Health is {ur5.value}."
+        if moveit not in {SystemComponentStatus.READY, SystemComponentStatus.RUNNING}:
+            return False, f"Real execution blocked: MoveIt ROS Health is {moveit.value}."
+        return True, "Real motion preflight passed."
+
+    def consume_real_gripper_confirmation(self, node_id: str) -> bool:
+        """Consume a one-shot GUI confirmation; approvals cannot be replayed."""
+        if node_id not in self._real_gripper_confirmed_nodes:
+            return False
+        self._real_gripper_confirmed_nodes.remove(node_id)
         return True
 
     def _submit_existing_trajectory_decision(self, request: HitlRequest, decision: HitlDecision) -> bool:
@@ -1268,7 +1361,7 @@ class GuiController:
         if event_type in {"hitl_approved", "hitl_rejected", "hitl_replan_requested", "plan_version_changed"}:
             self.state.modification_history.append(event)
         if self._log_renderer is not None:
-            self._log_renderer.refresh()
+            self._log_view_dirty = True
         self._refresh_event_views()
         if event_type in {"task_completed", "task_cancelled", "task_failed"} and self.state.current_task_id:
             try:
@@ -1278,7 +1371,17 @@ class GuiController:
         return event
 
     def _refresh_event_views(self) -> None:
-        """Refresh state-machine views only when their underlying data changes."""
+        """Mark state-machine views dirty without touching UI from workers."""
+        self._event_views_dirty = True
+
+    def _flush_event_views(self) -> None:
+        """Refresh dirty views from the NiceGUI page timer's slot context."""
+        if self._log_view_dirty and self._log_renderer is not None:
+            self._log_view_dirty = False
+            self._log_renderer.refresh()
+        if not self._event_views_dirty:
+            return
+        self._event_views_dirty = False
         for renderer in self._event_renderers:
             renderer()
 
@@ -1350,18 +1453,39 @@ class GuiController:
                           metadata={"trajectory_id": trajectory_id, "preview": result})
 
     def shutdown(self) -> None:
+        if self._shutdown_complete:
+            return
+        self._shutdown_complete = True
         self.embedded_rviz_manager.cleanup()
         self.stop_rviz()
+        self.skill_runtime.shutdown()
         if self.ros_worker:
             self.ros_worker.shutdown()
         self.component_manager.shutdown()
+
+    def _component_conflict_reason(self, component_id: str, component: dict) -> str | None:
+        """Refuse duplicate ROS stacks without taking ownership of external nodes."""
+        expected = {str(name) for name in component.get("conflict_node_names", [])}
+        if not expected or self.ros_worker is None:
+            return None
+        snapshot = self.ros_worker.snapshot()
+        existing = [name for name in snapshot.get("node_fqns", []) if name in expected]
+        if not existing:
+            return None
+        counts = {name: existing.count(name) for name in sorted(set(existing))}
+        summary = ", ".join(f"{name} (count={count})" for name, count in counts.items())
+        return (
+            f"Refusing to start {component_id}: existing ROS node(s) detected: {summary}. "
+            "The GUI will not terminate externally started or orphaned processes; "
+            "stop them explicitly, wait for the ROS graph to clear, then retry."
+        )
 
     def refresh_component_processes(self) -> None:
         self.state.component_processes = self.component_manager.refresh()
 
     def start_component(self, component_id: str, *, confirmed: bool = False):
-        if component_id == "ur5_real" and not self.gui_config.get("enable_real_execution", False):
-            raise RuntimeError("Real UR5 startup is disabled by enable_real_execution=false.")
+        if component_id == "ur5_real" and not self.gui_config.get("enable_real_driver_start", False):
+            raise RuntimeError("Real UR5 startup is disabled by enable_real_driver_start=false.")
         self.append_event("component_start_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
         managed = self.component_manager.start_component(component_id, confirmed=confirmed)
         if component_id == "ur5_fake" and managed.status.value == "RUNNING":
@@ -1382,16 +1506,37 @@ class GuiController:
         return managed
 
     def restart_component(self, component_id: str, *, confirmed: bool = False):
+        if component_id == "ur5_real" and not self.gui_config.get("enable_real_driver_start", False):
+            raise RuntimeError("Real UR5 startup is disabled by enable_real_driver_start=false.")
         self.append_event("component_restart_requested", metadata={"component_id": component_id, "initiated_by": "gui"})
         managed = self.component_manager.restart_component(component_id, confirmed=confirmed)
         self.refresh_component_processes()
         return managed
 
     def confirm_real_ur5_start(self):
-        if not self.gui_config.get("enable_real_execution", False):
-            raise RuntimeError("Real UR5 startup is disabled by enable_real_execution=false.")
-        self.append_event("real_robot_driver_confirmed", metadata={"component_id": "ur5_real", "robot_ip": "192.168.10.27", "initiated_by": "gui"})
+        if not self.gui_config.get("enable_real_driver_start", False):
+            raise RuntimeError("Real UR5 startup is disabled by enable_real_driver_start=false.")
+        details = self.real_ur5_launch_details()
+        self.append_event("real_robot_driver_confirmed", metadata={
+            "component_id": "ur5_real", "robot_ip": details["robot_ip"],
+            "ros_domain_id": details["ros_domain_id"], "initiated_by": "gui",
+        })
         return self.start_component("ur5_real", confirmed=True)
+
+    def real_ur5_launch_details(self) -> dict[str, Any]:
+        """Return operator-visible real-driver settings without hardcoding them in a panel."""
+        launcher = self.gui_config.get("system_launcher", {})
+        component = launcher.get("components", {}).get("ur5_real", {})
+        arguments = component.get("arguments", [])
+        values = {
+            key: value for item in arguments if ":=" in str(item)
+            for key, value in [str(item).split(":=", 1)]
+        }
+        return {
+            "robot_ip": values.get("robot_ip", "UNKNOWN"),
+            "ros_domain_id": launcher.get("ros_domain_id", "UNKNOWN"),
+            "launch_rviz": values.get("launch_rviz", "UNKNOWN"),
+        }
 
     def _finish_human_wait(self) -> None:
         started = self.state.experiment_metrics.human_wait_started_at
@@ -1467,10 +1612,18 @@ class GuiController:
         self.runtime_adapters.ros_node = getattr(self.ros_worker, "node", None)
         self.state.ros_executor_running = snapshot["executor_running"]
         self.state.ros_node_initialized = snapshot["node_initialized"]
-        if snapshot.get("worker_error"):
+        worker_error = snapshot.get("worker_error")
+        if worker_error:
             self.state.ros_status = SystemComponentStatus.ERROR
+            if worker_error != self._last_ros_worker_error:
+                self.append_event(
+                    "ros_executor_failed",
+                    metadata={"error": worker_error},
+                )
+            self._last_ros_worker_error = worker_error
         elif snapshot["executor_running"] and snapshot["node_initialized"]:
             self.state.ros_status = SystemComponentStatus.RUNNING
+            self._last_ros_worker_error = None
         else:
             self.state.ros_status = SystemComponentStatus.IDLE
         monitor = self.gui_config.get("ros_monitor", {})
@@ -1502,3 +1655,33 @@ class GuiController:
         if not start or not end:
             return None
         return int((datetime.fromisoformat(end) - datetime.fromisoformat(start)).total_seconds() * 1000)
+
+
+def _planning_failure_reason(record, fallback: str) -> str:
+    """Expose MoveIt and validator diagnostics instead of a generic failure."""
+    parts: list[str] = []
+    summary = record.summary if isinstance(record.summary, dict) else {}
+    if not bool(summary.get("success")):
+        message = summary.get("message")
+        if message:
+            parts.append(str(message))
+        diagnostics = (
+            summary.get("trajectory_preview", {}).get("moveit_diagnostics", {})
+            if isinstance(summary.get("trajectory_preview"), dict)
+            else {}
+        )
+        error_name = diagnostics.get("error_code_name")
+        error_value = diagnostics.get("error_code_value")
+        if error_name and str(error_name) not in " ".join(parts):
+            parts.append(f"MoveIt error: {error_name} ({error_value}).")
+    validation = (
+        record.validation_result
+        if isinstance(record.validation_result, dict)
+        else {}
+    )
+    if validation.get("decision") != "ALLOW":
+        reasons = validation.get("reasons") or []
+        if isinstance(reasons, str):
+            reasons = [reasons]
+        parts.extend(str(reason) for reason in reasons if reason)
+    return " ".join(dict.fromkeys(parts)) or fallback

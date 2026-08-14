@@ -19,10 +19,43 @@ def test_stage10_config_has_canonical_settings_and_resolved_rviz_path():
     config = load_gui_config()
     assert {
         "host", "port", "refresh_rate", "status_timeout", "rviz_config",
-        "log_directory", "robot_mode", "enable_editable_nodes", "enable_real_execution",
+        "log_directory", "robot_mode", "enable_editable_nodes",
+        "enable_real_driver_start", "enable_real_execution",
     } <= config.keys()
     assert config["rviz_config"].endswith("config/embedded_robot_only.rviz")
+    assert config["enable_real_driver_start"] is True
     assert config["enable_real_execution"] is False
+
+
+def test_launch_ros_arguments_do_not_terminate_gui_argument_parser(monkeypatch):
+    from hitl_gui.main import parse_args
+
+    monkeypatch.setattr("sys.argv", [
+        "hitl_gui", "--host", "127.0.0.1", "--simulation", "false",
+        "--ros-args", "-r", "__node:=hitl_gui",
+    ])
+    args = parse_args()
+    assert args.host == "127.0.0.1"
+    assert args.simulation is False
+
+
+def test_real_driver_start_is_independent_from_real_motion_execution():
+    from hitl_gui.managed_process import ManagedProcess, ProcessStatus
+
+    controller = GuiController()
+    controller.gui_config["enable_real_driver_start"] = True
+    controller.gui_config["enable_real_execution"] = False
+    calls = []
+    controller.component_manager.start_component = lambda component_id, confirmed=False: (
+        calls.append((component_id, confirmed)) or ManagedProcess(
+            component_id, "UR5 Real Hardware", ["ros2", "launch"], None,
+            status=ProcessStatus.RUNNING,
+        )
+    )
+    result = controller.confirm_real_ur5_start()
+    assert result.status == ProcessStatus.RUNNING
+    assert calls == [("ur5_real", True)]
+    assert controller.gui_config["enable_real_execution"] is False
 
 
 def test_unified_launch_declares_all_public_arguments():
@@ -39,6 +72,7 @@ def test_unified_launch_declares_all_public_arguments():
     assert names == {
         "gui_enabled", "rviz_enabled", "agent_enabled", "perception_enabled",
         "grasp_enabled", "simulation", "gui_port", "gui_host",
+        "real_execution_enabled",
     }
 
 
@@ -84,6 +118,13 @@ def test_launch_overrides_keep_real_execution_disabled():
     assert controller.gui_config["enable_real_execution"] is False
     assert controller.runtime_backend_config.perception_mode == "mock"
     assert controller.runtime_backend_config.grasp_mode == "mock"
+
+
+def test_real_execution_opt_in_is_scoped_to_controller_session():
+    enabled = GuiController(config_overrides={"real_execution_enabled": True})
+    default = GuiController()
+    assert enabled.gui_config["enable_real_execution"] is True
+    assert default.gui_config["enable_real_execution"] is False
 
 
 def test_unrecoverable_failure_automatically_writes_failed_summary(tmp_path):

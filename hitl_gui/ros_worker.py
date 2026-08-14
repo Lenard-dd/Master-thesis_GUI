@@ -61,7 +61,7 @@ class RosWorker:
             while not self._stop_event.is_set():
                 self._executor.spin_once(timeout_sec=0.2)
         except Exception as exc:
-            self.error = str(exc)
+            self.error = f"{type(exc).__name__}: {exc}"
         finally:
             self.executor_running = False
             if self._executor and self._node:

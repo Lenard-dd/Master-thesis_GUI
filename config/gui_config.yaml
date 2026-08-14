@@ -11,7 +11,15 @@ rviz_config: "config/embedded_robot_only.rviz"
 log_directory: "logs"
 robot_mode: "REAL ROBOT"
 enable_editable_nodes: false
+enable_real_driver_start: true
 enable_real_execution: false
+real_execution:
+  require_ros_health_ready: true
+  # When real execution is explicitly enabled for one GUI process, clicking
+  # Approve on that exact trajectory is its final arm confirmation.
+  arm_approve_is_confirmation: true
+  arm_confirmation_phrase: "EXECUTE"
+  gripper_confirmation_phrase: "YES"
 mode: "REAL ROBOT"
 ros_status: "MOCK"
 gui_mode: "ROS"
@@ -34,7 +42,7 @@ phase9:
   # Real-mode planning and RViz preview are available. Physical execution is
   # governed separately by the top-level enable_real_execution safety gate.
   simulation_only: false
-  place_named_target: "home"
+  place_named_target: "safe_home"
   mock_verification_success: true
   target_review:
     always_when_multiple: true
@@ -76,6 +84,9 @@ simulation_motion:
 system_launcher:
   ros_domain_id: 27
   workspace_path: "/home/lenard/dev_ws"
+  # Linux parent-death signal: if the GUI process disappears unexpectedly,
+  # each GUI-owned launcher receives SIGINT and shuts down its ROS children.
+  parent_death_signal: "SIGINT"
   components:
     camera:
       type: ros2_launch
@@ -83,6 +94,7 @@ system_launcher:
       package: realsense2_camera
       launch_file: rs_launch.py
       arguments: ["enable_rgbd:=true", "enable_sync:=true", "align_depth.enable:=true", "enable_color:=true", "enable_depth:=true", "pointcloud.enable:=true"]
+      conflict_node_names: ["/camera/camera"]
       timeout_sec: 15
     ur5_fake:
       type: ros2_launch
@@ -90,6 +102,7 @@ system_launcher:
       package: ur5_launcher
       launch_file: ur5_complete.launch.py
       arguments: ["robot_ip:=192.168.10.27", "use_fake_hardware:=true", "activate_joint_controller:=true", "start_camera_node:=false", "use_nominal_camera_extrinsics:=true", "launch_rviz:=false"]
+      conflict_node_names: ["/move_group"]
       timeout_sec: 20
     ur5_real:
       type: ros2_launch
@@ -97,6 +110,7 @@ system_launcher:
       package: ur5_launcher
       launch_file: ur5_complete.launch.py
       arguments: ["robot_ip:=192.168.10.27", "use_fake_hardware:=false", "activate_joint_controller:=true", "start_camera_node:=false", "use_nominal_camera_extrinsics:=true", "launch_rviz:=false"]
+      conflict_node_names: ["/move_group"]
       requires_confirmation: true
       timeout_sec: 20
     gripper:
