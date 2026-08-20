@@ -217,6 +217,14 @@ class GuiController:
                 name=self.agent_name,
             )
             return "capabilities-query"
+        if ExistingAgentBridge.is_named_target_question(task_name):
+            self.add_chat_message(task_name, sent=True, name="Operator")
+            self.add_chat_message(
+                ExistingAgentBridge.named_target_message(task_name),
+                sent=False,
+                name=self.agent_name,
+            )
+            return "named-target-query"
         if self.gui_config.get("agent_bridge", {}).get("mode", "mock") != "mock":
             return self._start_agent_task(task_name)
         if self.state.task_status not in {TaskStatus.IDLE, TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED}:
@@ -954,6 +962,11 @@ class GuiController:
             and node.tool_name in {"open_gripper", "close_gripper"}
             and request.request_type == "task_intent"
         )
+        gripper_execution_request = (
+            node is not None
+            and node.tool_name in {"open_gripper", "close_gripper"}
+            and request.request_type == "execution"
+        )
         real_command_gate = request.request_type in {"trajectory_review", "execution"} or direct_gripper_request
         if decision == HitlDecision.APPROVE and real_robot and real_command_gate:
             if not self.gui_config.get("enable_real_execution", False):
@@ -968,6 +981,7 @@ class GuiController:
                 return False
             approve_is_confirmation = (
                 direct_gripper_request
+                or gripper_execution_request
                 or (
                     request.request_type == "trajectory_review"
                     and self.gui_config.get("real_execution", {}).get(

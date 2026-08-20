@@ -59,6 +59,8 @@ class ExistingAgentBridge:
     ) -> AgentResponse:
         if self.is_capability_question(instruction):
             return AgentResponse(self.capabilities_message())
+        if self.is_named_target_question(instruction):
+            return AgentResponse(self.named_target_message())
         conversation = self.short_conversation_response(
             instruction, conversation_config or {}
         )
@@ -86,11 +88,12 @@ class ExistingAgentBridge:
         if decision.kind == AgentDecisionKind.TOOL_CALL and decision.tool_call:
             call = decision.tool_call
             plan_step = proposal.plan_step
+            arguments = self._normalise_tool_arguments(call.tool_name, call.arguments)
             return AgentResponse(decision.message, [AgentToolEvent(
                 node_id=f"agent-{call.tool_name}-1", parent_id=None,
                 tool_name=call.tool_name, display_name=call.tool_name.replace("_", " ").title(),
                 status="waiting_approval" if proposal.requires_human_gate else "pending",
-                input_json=dict(call.arguments),
+                input_json=arguments,
                 output_json={"approval_stages": approval_stages},
                 requires_approval=proposal.requires_human_gate,
                 approval_stages=approval_stages,
@@ -119,6 +122,58 @@ class ExistingAgentBridge:
             "你能做什么", "能做什么", "可以做什么", "支持什么", "有哪些功能", "可以完成什么",
         )
         return any(phrase in text for phrase in phrases)
+
+    @staticmethod
+    def is_named_target_question(instruction: str) -> bool:
+        """Recognise questions about configured movement targets, not a move request."""
+        text = instruction.lower().strip()
+        refers_to_target = any(term in text for term in (
+            "target", "targets", "named target", "目标", "位置", "地点",
+        ))
+        refers_to_motion = any(term in text for term in (
+            "move", "moving", "movement", "go to", "移动", "前往", "去",
+        ))
+        asks_a_question = any(term in text for term in (
+            "which", "what", "allowed", "available", "can i", "哪些", "什么", "允许", "可用", "能否", "可以",
+        ))
+        return refers_to_target and refers_to_motion and asks_a_question
+
+    @staticmethod
+    def _allowed_named_targets() -> tuple[str, ...]:
+        """Read the same restricted-real-arm allow-list used during execution."""
+        try:
+            from llm_skill_robot.safety.real_arm_safety import load_real_arm_safety
+
+            return load_real_arm_safety().allowed_named_targets
+        except Exception:
+            # Do not claim that an unverified target is permitted if the safety
+            # configuration cannot be read.
+            return ()
+
+    @classmethod
+    def named_target_message(cls, instruction: str = "") -> str:
+        targets = cls._allowed_named_targets()
+        target_text = ", ".join(targets) if targets else "not available"
+        chinese = any("\u4e00" <= char <= "\u9fff" for char in instruction)
+        if chinese:
+            if not targets:
+                return "暂时无法读取真机可用的命名目标配置。"
+            return f"当前真机允许的命名目标是：{target_text}。如需回到初始安全位，请使用 safe_home；home 会自动映射为 safe_home。"
+        if not targets:
+            return "I can't read the configured real-robot named targets right now."
+        return f"The currently allowed real-robot named targets are: {target_text}. Use safe_home for the home position; home is mapped to safe_home."
+
+    @staticmethod
+    def _normalise_tool_arguments(tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Map friendly target aliases to the safety-approved canonical name."""
+        normalised = dict(arguments)
+        if tool_name != "move_to_named_target":
+            return normalised
+        for key in ("target_name", "target"):
+            value = normalised.get(key)
+            if isinstance(value, str) and value.strip().casefold() in {"home", "home position"}:
+                normalised[key] = "safe_home"
+        return normalised
 
     @classmethod
     def short_conversation_response(
@@ -282,7 +337,7 @@ class ExistingAgentBridge:
         if "safe_pick_object" in composites:
             items.append("propose a supervised pick for a clearly specified object")
         if "move_to_named_target" in tools:
-            items.append("plan movement to the named targets home, safe_home, or observe")
+            items.append("propose movement to configured named targets")
         if "place_object" in tools:
             items.append("propose placing an object that is already held")
         if {"open_gripper", "close_gripper", "get_gripper_state"} & tools:

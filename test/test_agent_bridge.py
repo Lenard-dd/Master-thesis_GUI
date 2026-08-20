@@ -18,6 +18,23 @@ def test_capability_question_returns_registered_skill_summary_without_a_task():
     assert "plan-only" in response.message
 
 
+def test_named_target_question_reports_the_real_arm_allow_list_without_a_task():
+    response = ExistingAgentBridge("existing_openai").submit("which target is allowed for moving")
+
+    assert response.tool_events == []
+    assert "safe_home" in response.message
+    assert "observe" in response.message
+
+
+def test_home_target_is_normalised_to_the_safe_home_alias():
+    assert ExistingAgentBridge._normalise_tool_arguments(
+        "move_to_named_target", {"target_name": "home"}
+    ) == {"target_name": "safe_home"}
+    assert ExistingAgentBridge._normalise_tool_arguments(
+        "move_to_named_target", {"target": "observe"}
+    ) == {"target": "observe"}
+
+
 def test_simple_chinese_conversation_does_not_enter_the_task_agent():
     response = ExistingAgentBridge("existing_openai").submit("干得好")
 
@@ -55,6 +72,14 @@ def test_capability_question_reports_approved_real_execution_when_enabled():
     assert controller.start_task("What can you do?") == "capabilities-query"
     assert "execute approved real-robot actions" in controller.state.conversation[-1].text
     assert "human approval" in controller.state.conversation[-1].text
+
+
+def test_named_target_question_is_answered_in_chat_without_creating_a_plan():
+    controller = GuiController()
+
+    assert controller.start_task("which target is allowed for moving") == "named-target-query"
+    assert controller.state.current_task_plan is None
+    assert "safe_home" in controller.state.conversation[-1].text
 
 
 def test_welcome_message_is_added_only_once():

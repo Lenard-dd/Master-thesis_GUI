@@ -23,11 +23,30 @@ def create_tool_flow_panel(controller):
     refresh_state = {"dirty": False}
     scroll_state = {"signature": ()}
     details_state: dict[str, dict[str, bool]] = {}
+    details_visible = {"value": False}
 
     def select_node(node_id: str) -> None:
         controller.select_task_node(node_id)
         task_flow.refresh()
+        if details_visible["value"]:
+            details_panel.refresh()
+
+    def show_node_details(node_id: str) -> None:
+        controller.select_task_node(node_id)
+        details_visible["value"] = True
+        flow_grid.classes(remove="2xl:grid-cols-1")
+        flow_grid.classes(add="2xl:grid-cols-[minmax(0,70fr)_minmax(250px,30fr)]")
+        details_column.set_visibility(True)
+        task_flow.refresh()
         details_panel.refresh()
+
+    def hide_node_details() -> None:
+        details_visible["value"] = False
+        controller.select_task_node(None)
+        flow_grid.classes(remove="2xl:grid-cols-[minmax(0,70fr)_minmax(250px,30fr)]")
+        flow_grid.classes(add="2xl:grid-cols-1")
+        details_column.set_visibility(False)
+        task_flow.refresh()
 
     with ui.card().classes("w-full h-full min-h-[520px] p-3"):
         ui.label("Agent Execution Flow").classes("text-lg font-semibold")
@@ -90,12 +109,12 @@ def create_tool_flow_panel(controller):
                         previous_phase = node.phase
                     _node_row(
                         controller, node, labels[node.node_id], labels,
-                        select_node, plan.version if plan else 1,
+                        select_node, show_node_details, plan.version if plan else 1,
                     )
                     for review in reviews:
                         _review_row(
                             controller, review, labels[review.node_id], labels,
-                            select_node, plan.version if plan else 1,
+                            select_node, show_node_details, plan.version if plan else 1,
                         )
                     if index < len(entries):
                         with ui.row().classes("w-full h-4 items-center"):
@@ -109,7 +128,9 @@ def create_tool_flow_panel(controller):
                 controller.state.selected_task_node_id,
             )
             with ui.card().classes("w-full bg-grey-1 p-2"):
-                ui.label("Selected Node Details").classes("text-sm font-semibold")
+                with ui.row().classes("w-full items-center justify-between no-wrap"):
+                    ui.label("Selected Node Details").classes("text-sm font-semibold")
+                    ui.button(icon="close", on_click=hide_node_details).props("flat round dense").tooltip("Close details")
                 if details is None:
                     ui.label("Select a step to inspect its data and attempts.").classes("text-xs text-grey-7")
                     return
@@ -153,15 +174,16 @@ def create_tool_flow_panel(controller):
 
         plan_header()
         with ui.element("div").classes(
-            "w-full grid grid-cols-1 2xl:grid-cols-[minmax(0,70fr)_minmax(250px,30fr)] gap-2 items-start"
-        ):
+            "w-full grid grid-cols-1 2xl:grid-cols-1 gap-2 items-start"
+        ) as flow_grid:
             with ui.column().classes("w-full min-w-0"):
                 # Keep the scroll container stable while refreshable rebuilds
                 # only its contents; this preserves its scroll position.
                 with ui.scroll_area().classes("w-full h-[65vh] min-h-[420px] max-h-[720px]") as task_scroll:
                     task_flow()
-            with ui.column().classes("w-full min-w-0 2xl:sticky 2xl:top-2"):
+            with ui.column().classes("w-full min-w-0 2xl:sticky 2xl:top-2") as details_column:
                 details_panel()
+                details_column.set_visibility(False)
 
         scroll_state["signature"] = timeline_signature(controller.state.current_task_plan)
 
@@ -175,7 +197,8 @@ def create_tool_flow_panel(controller):
         )
         plan_header.refresh()
         task_flow.refresh()
-        details_panel.refresh()
+        if details_visible["value"]:
+            details_panel.refresh()
         scroll_state["signature"] = new_signature
         if step_added:
             # Native NiceGUI ScrollArea method; no page reload or custom JS.
@@ -193,7 +216,7 @@ def create_tool_flow_panel(controller):
         if plan and any(str(node.status).upper() == "RUNNING" for node in plan.nodes.values()):
             task_flow.refresh()
             selected = plan.nodes.get(controller.state.selected_task_node_id or "")
-            if selected and str(selected.status).upper() == "RUNNING":
+            if details_visible["value"] and selected and str(selected.status).upper() == "RUNNING":
                 details_panel.refresh()
 
     ui.timer(0.15, flush_if_dirty)
@@ -207,7 +230,7 @@ def _phase_divider(phase: str) -> None:
         ui.separator().classes("flex-grow")
 
 
-def _node_row(controller, node, step_label, labels, on_select, current_plan_version) -> None:
+def _node_row(controller, node, step_label, labels, on_select, on_open_details, current_plan_version) -> None:
     presentation = status_presentation(node.status)
     attempts = controller.state.node_attempts.get(node.node_id, [])
     selected = controller.state.selected_task_node_id == node.node_id
@@ -215,7 +238,7 @@ def _node_row(controller, node, step_label, labels, on_select, current_plan_vers
     summary = node_summary(node)
     expanded = str(node.status).upper() in EXPANDED_STATUSES or len(attempts) > 1
     card = ui.card().classes(f"w-full px-2 py-1 cursor-pointer border {border} hover:bg-blue-1")
-    card.on("click", lambda _event, node_id=node.node_id: on_select(node_id))
+    card.on("dblclick", lambda _event, node_id=node.node_id: on_open_details(node_id))
     with card:
         with ui.row().classes("w-full min-h-[38px] items-center gap-2 no-wrap"):
             ui.label(step_label).classes("w-8 text-center text-xs font-mono text-grey-7")
@@ -228,12 +251,12 @@ def _node_row(controller, node, step_label, labels, on_select, current_plan_vers
             _node_meta(node, attempts, labels, current_plan_version)
 
 
-def _review_row(controller, node, step_label, labels, on_select, current_plan_version) -> None:
+def _review_row(controller, node, step_label, labels, on_select, on_open_details, current_plan_version) -> None:
     presentation = status_presentation(node.status)
     selected = controller.state.selected_task_node_id == node.node_id
     border = "border-primary bg-amber-1" if selected else "border-amber-5 bg-amber-1"
     card = ui.card().classes(f"ml-10 w-[calc(100%-2.5rem)] px-2 py-1 cursor-pointer border-l-4 {border}")
-    card.on("click", lambda _event, node_id=node.node_id: on_select(node_id))
+    card.on("dblclick", lambda _event, node_id=node.node_id: on_open_details(node_id))
     with card:
         with ui.row().classes("w-full min-h-[32px] items-center gap-2 no-wrap"):
             ui.label(step_label).classes("w-8 text-center text-[10px] font-mono text-grey-7")

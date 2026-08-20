@@ -125,10 +125,19 @@ def _approve(controller, submit) -> None:
     request = controller.state.pending_hitl_request
     real_command_gate = request and request.request_type in {"trajectory_review", "execution"}
     if real_command_gate and controller.state.robot_mode in {"REAL", "REAL ROBOT"}:
+        node = controller._node(request.target_id)
+        gripper_execution_request = (
+            request.request_type == "execution"
+            and node is not None
+            and node.tool_name in {"open_gripper", "close_gripper"}
+        )
         if (
-            request.request_type == "trajectory_review"
-            and controller.gui_config.get("real_execution", {}).get(
-                "arm_approve_is_confirmation", False
+            gripper_execution_request
+            or (
+                request.request_type == "trajectory_review"
+                and controller.gui_config.get("real_execution", {}).get(
+                    "arm_approve_is_confirmation", False
+                )
             )
         ):
             accepted = controller.submit_hitl_decision(
@@ -136,7 +145,7 @@ def _approve(controller, submit) -> None:
             )
             if not accepted:
                 ui.notify(
-                    controller.last_decision_error or "Real trajectory approval was rejected.",
+                    controller.last_decision_error or "Real execution approval was rejected.",
                     type="negative",
                 )
             return

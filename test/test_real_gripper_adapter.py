@@ -1,6 +1,6 @@
 import asyncio
 
-from hitl_gui.app_state import ToolNode, ToolStatus
+from hitl_gui.app_state import HitlDecision, ToolNode, ToolStatus
 from hitl_gui.gui_controller import GuiController
 from hitl_gui.real_gripper_adapter import RealGripperRuntimeAdapter
 
@@ -80,6 +80,35 @@ def test_gui_real_open_gripper_uses_confirmed_existing_backend():
         assert backend.calls == [("open_gripper", {"confirmed": True})]
         assert completed == [True]
         controller.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_safe_pick_gripper_execution_approval_needs_no_confirmation_phrase():
+    async def scenario():
+        controller = GuiController(config_overrides={"gui_mode": "MOCK"})
+        controller.state.robot_mode = "REAL ROBOT"
+        controller.gui_config["enable_real_execution"] = True
+        controller.state.current_task_id = "task-safe-pick-gripper"
+        node = ToolNode(
+            node_id="close-1", parent_id="safe-pick", tool_name="close_gripper",
+            display_name="Close Gripper", status=ToolStatus.WAITING_APPROVAL,
+            input_data={"during_contact": True},
+        )
+        controller.state.tool_nodes.append(node)
+        calls = []
+
+        async def execute(gripper_node):
+            calls.append(gripper_node.node_id)
+
+        controller.skill_runtime.execute_gripper_after_release = execute
+        request = controller.create_agent_hitl_request(node, ["execution"])
+        assert request is not None
+        assert controller.submit_hitl_decision(request.request_id, HitlDecision.APPROVE)
+        await controller._last_skill_task
+
+        assert calls == ["close-1"]
+        assert "close-1" in controller._real_gripper_confirmed_nodes
 
     asyncio.run(scenario())
 
