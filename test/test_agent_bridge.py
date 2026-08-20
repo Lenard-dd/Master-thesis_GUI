@@ -30,17 +30,21 @@ def test_weather_question_uses_current_weather_reply(monkeypatch):
         ExistingAgentBridge,
         "_fetch_current_weather",
         staticmethod(lambda _location, _timeout: {
-            "location": "Berlin", "condition": "局部多云",
+            "location": "Aachen", "weather_code": 2,
             "temperature": 20.0, "apparent_temperature": 19.0,
         }),
     )
 
     response = ExistingAgentBridge("existing_openai").submit(
-        "柏林天气怎么样？", conversation_config={"weather_location": "Berlin, Germany"}
+        "How's the weather today in Aachen?", conversation_config={"weather_location": "Berlin, Germany"}
     )
 
     assert response.tool_events == []
-    assert "Berlin当前局部多云，20°C" in response.message
+    assert "Current weather in Aachen: partly cloudy, 20°C" in response.message
+
+
+def test_weather_location_is_extracted_from_chinese_question():
+    assert ExistingAgentBridge._weather_location("深圳今天天气怎么样？", "Berlin, Germany") == "深圳"
 
 
 def test_capability_question_reports_approved_real_execution_when_enabled():
