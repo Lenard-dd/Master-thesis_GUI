@@ -97,7 +97,7 @@ class ExistingAgentBridge:
         return any(phrase in text for phrase in phrases)
 
     @staticmethod
-    def capabilities_message() -> str:
+    def capabilities_message(*, real_execution_enabled: bool = False) -> str:
         """Describe current registered capabilities without contacting an LLM."""
         try:
             from llm_skill_robot.agent.composite_skills.registry import CompositeSkillRegistry
@@ -122,8 +122,14 @@ class ExistingAgentBridge:
             items.append("check or propose approved gripper operations")
 
         capability_list = "; ".join(items) if items else "inspect the currently registered robot skills"
+        safety_message = (
+            "This GUI can execute approved real-robot actions in this session. "
+            "Every motion and gripper command remains subject to configured safety checks and human approval."
+            if real_execution_enabled
+            else "This GUI is currently plan-only, so no robot motion is executed from this chat."
+        )
         return (
             f"I can currently help you {capability_list}. "
             "I will ask for clarification when the target or task is ambiguous, and I will stop at the required human review points. "
-            "This GUI is still plan-only, so no robot motion is executed from this chat."
+            f"{safety_message}"
         )

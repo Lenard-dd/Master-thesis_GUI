@@ -206,7 +206,16 @@ class GuiController:
             return None
         if ExistingAgentBridge.is_capability_question(task_name):
             self.add_chat_message(task_name, sent=True, name="Operator")
-            self.add_chat_message(ExistingAgentBridge.capabilities_message(), sent=False, name=self.agent_name)
+            self.add_chat_message(
+                ExistingAgentBridge.capabilities_message(
+                    real_execution_enabled=(
+                        self.state.robot_mode in {"REAL", "REAL ROBOT"}
+                        and self.gui_config.get("enable_real_execution", False)
+                    )
+                ),
+                sent=False,
+                name=self.agent_name,
+            )
             return "capabilities-query"
         if self.gui_config.get("agent_bridge", {}).get("mode", "mock") != "mock":
             return self._start_agent_task(task_name)
@@ -937,8 +946,14 @@ class GuiController:
         if request.request_id != request_id or request.task_id != self.state.current_task_id:
             self.last_decision_error = "The approval does not belong to the current task/request."
             return False
+        node = self._node(request.target_id)
         real_robot = self.state.robot_mode in {"REAL", "REAL ROBOT"}
-        real_command_gate = request.request_type in {"trajectory_review", "execution"}
+        direct_gripper_request = (
+            node is not None
+            and node.tool_name in {"open_gripper", "close_gripper"}
+            and request.request_type == "task_intent"
+        )
+        real_command_gate = request.request_type in {"trajectory_review", "execution"} or direct_gripper_request
         if decision == HitlDecision.APPROVE and real_robot and real_command_gate:
             if not self.gui_config.get("enable_real_execution", False):
                 self.last_decision_error = (
@@ -951,9 +966,12 @@ class GuiController:
                 )
                 return False
             approve_is_confirmation = (
-                request.request_type == "trajectory_review"
-                and self.gui_config.get("real_execution", {}).get(
-                    "arm_approve_is_confirmation", False
+                direct_gripper_request
+                or (
+                    request.request_type == "trajectory_review"
+                    and self.gui_config.get("real_execution", {}).get(
+                        "arm_approve_is_confirmation", False
+                    )
                 )
             )
             expected_phrase = self.real_confirmation_phrase(request.request_type)
@@ -974,7 +992,9 @@ class GuiController:
                         metadata={"request_id": request.request_id, "reason": reason},
                     )
                     return False
-            else:
+            elif request.request_type == "execution":
+                self._real_gripper_confirmed_nodes.add(request.target_id)
+            elif direct_gripper_request:
                 self._real_gripper_confirmed_nodes.add(request.target_id)
             real_confirmed = True
         if request.request_type != "trajectory_review":
@@ -1236,6 +1256,12 @@ class GuiController:
             elif node and node.tool_name == "review_grasp_candidate" and request.request_type == "grasp_candidate":
                 node.status = ToolStatus.SUCCEEDED
                 self.skill_runtime.continue_after_grasp_review(node)
+            elif node and node.tool_name in {"open_gripper", "close_gripper"} and request.request_type == "task_intent":
+                # A standalone gripper task has no planning stage. Its initial
+                # approval is the final release and may be consumed only once.
+                self._last_skill_task = asyncio.create_task(
+                    self.skill_runtime.execute_gripper_after_release(node)
+                )
             elif node and node.tool_name in {"open_gripper", "close_gripper"} and request.request_type == "execution":
                 self._last_skill_task = asyncio.create_task(
                     self.skill_runtime.execute_gripper_after_release(node)

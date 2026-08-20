@@ -1,3 +1,5 @@
+import asyncio
+
 from hitl_gui.agent_bridge import AgentResponse, AgentToolEvent, ExistingAgentBridge
 from hitl_gui.app_state import HitlDecision, TaskStatus, ToolStatus
 from hitl_gui.gui_controller import GuiController
@@ -14,6 +16,16 @@ def test_capability_question_returns_registered_skill_summary_without_a_task():
     assert response.tool_events == []
     assert "supervised pick" in response.message
     assert "plan-only" in response.message
+
+
+def test_capability_question_reports_approved_real_execution_when_enabled():
+    controller = GuiController()
+    controller.state.robot_mode = "REAL ROBOT"
+    controller.gui_config["enable_real_execution"] = True
+
+    assert controller.start_task("What can you do?") == "capabilities-query"
+    assert "execute approved real-robot actions" in controller.state.conversation[-1].text
+    assert "human approval" in controller.state.conversation[-1].text
 
 
 def test_welcome_message_is_added_only_once():
@@ -49,6 +61,33 @@ def test_agent_task_intent_approval_has_a_gui_request_and_does_not_execute():
     assert controller.state.task_status == TaskStatus.APPROVED_PENDING_EXECUTION
     assert controller.state.tool_nodes[-1].status == ToolStatus.PENDING
     assert controller.state.tool_nodes[-1].output_data["approval"] == "APPROVED"
+
+
+def test_direct_gripper_task_intent_approval_is_the_single_execution_release():
+    async def scenario():
+        controller = GuiController()
+        controller.state.robot_mode = "SIMULATION"
+        controller.state.current_task_id = "task-direct-gripper"
+        calls = []
+
+        async def execute(node):
+            calls.append(node.node_id)
+
+        controller.skill_runtime.execute_gripper_after_release = execute
+        controller.add_agent_tool_event(AgentToolEvent(
+            "close-gripper-1", None, "close_gripper", "Close Gripper",
+            "waiting_approval", requires_approval=True, approval_stages=["task_intent"],
+        ))
+
+        request = controller.state.pending_hitl_request
+        assert request is not None and request.request_type == "task_intent"
+        assert controller.submit_hitl_decision(request.request_id, HitlDecision.APPROVE)
+        await controller._last_skill_task
+
+        assert controller.state.pending_hitl_request is None
+        assert calls == ["close-gripper-1"]
+
+    asyncio.run(scenario())
 
 
 def test_async_events_only_mark_ui_dirty_until_page_timer_flushes():
