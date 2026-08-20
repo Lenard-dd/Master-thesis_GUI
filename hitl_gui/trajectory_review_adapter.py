@@ -80,8 +80,8 @@ class ExistingTrajectoryReviewAdapter:
         plan_version: int,
         *,
         skill_id: str,
-        velocity_scale: float = 0.03,
-        acceleration_scale: float = 0.03,
+        velocity_scale: float = 0.10,
+        acceleration_scale: float = 0.10,
         planning_kwargs: dict[str, Any] | None = None,
     ) -> TrajectoryRecord:
         """Plan one existing MoveIt pose motion; execution remains cached/gated."""

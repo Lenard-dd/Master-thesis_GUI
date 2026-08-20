@@ -86,8 +86,8 @@ simulation_motion:
   # Used only while the GUI runs in SIMULATION mode. These values determine
   # MoveIt's trajectory timing, so RViz previews and fake-hardware execution
   # move at the same speed. Real-robot limits are intentionally unaffected.
-  velocity_scale: 0.30
-  acceleration_scale: 0.30
+  velocity_scale: 0.20
+  acceleration_scale: 0.20
 system_launcher:
   ros_domain_id: 27
   workspace_path: "/home/lenard/dev_ws"
