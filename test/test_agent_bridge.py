@@ -18,6 +18,31 @@ def test_capability_question_returns_registered_skill_summary_without_a_task():
     assert "plan-only" in response.message
 
 
+def test_simple_chinese_conversation_does_not_enter_the_task_agent():
+    response = ExistingAgentBridge("existing_openai").submit("干得好")
+
+    assert response.tool_events == []
+    assert "谢谢" in response.message
+
+
+def test_weather_question_uses_current_weather_reply(monkeypatch):
+    monkeypatch.setattr(
+        ExistingAgentBridge,
+        "_fetch_current_weather",
+        staticmethod(lambda _location, _timeout: {
+            "location": "Berlin", "condition": "局部多云",
+            "temperature": 20.0, "apparent_temperature": 19.0,
+        }),
+    )
+
+    response = ExistingAgentBridge("existing_openai").submit(
+        "柏林天气怎么样？", conversation_config={"weather_location": "Berlin, Germany"}
+    )
+
+    assert response.tool_events == []
+    assert "Berlin当前局部多云，20°C" in response.message
+
+
 def test_capability_question_reports_approved_real_execution_when_enabled():
     controller = GuiController()
     controller.state.robot_mode = "REAL ROBOT"

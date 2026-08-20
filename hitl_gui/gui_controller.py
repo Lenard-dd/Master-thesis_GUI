@@ -275,6 +275,7 @@ class GuiController:
                 asyncio.to_thread(
                     ExistingAgentBridge(config["mode"]).submit, instruction,
                     config.get("execution_mode", "plan_only"),
+                    config.get("conversation", {}),
                 ),
                 timeout=config.get("timeout_sec", 15),
             )

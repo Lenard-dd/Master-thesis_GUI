@@ -6,8 +6,11 @@ tool executor, trajectory, or hardware interface is invoked here.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 
 @dataclass
@@ -39,9 +42,19 @@ class ExistingAgentBridge:
     def __init__(self, mode: str = "existing_scripted") -> None:
         self.mode = mode
 
-    def submit(self, instruction: str, execution_mode: str = "plan_only") -> AgentResponse:
+    def submit(
+        self,
+        instruction: str,
+        execution_mode: str = "plan_only",
+        conversation_config: dict[str, Any] | None = None,
+    ) -> AgentResponse:
         if self.is_capability_question(instruction):
             return AgentResponse(self.capabilities_message())
+        conversation = self.short_conversation_response(
+            instruction, conversation_config or {}
+        )
+        if conversation is not None:
+            return AgentResponse(conversation)
         try:
             from llm_skill_robot.agent.agent_controller import AgentController, AgentDecisionKind
             from llm_skill_robot.agent.agent_state import AgentState
@@ -95,6 +108,94 @@ class ExistingAgentBridge:
             "你能做什么", "能做什么", "可以做什么", "支持什么", "有哪些功能", "可以完成什么",
         )
         return any(phrase in text for phrase in phrases)
+
+    @classmethod
+    def short_conversation_response(
+        cls, instruction: str, config: dict[str, Any]
+    ) -> str | None:
+        """Return a concise non-task reply without invoking the task agent."""
+        if not config.get("enabled", True):
+            return None
+        text = instruction.lower().strip()
+        chinese = any("\u4e00" <= char <= "\u9fff" for char in instruction)
+        if cls._is_weather_question(text):
+            location = str(config.get("weather_location", "Berlin, Germany"))
+            timeout_sec = float(config.get("weather_timeout_sec", 3.0))
+            return cls._weather_reply(location, timeout_sec, chinese)
+
+        replies = (
+            (("干得好", "做得好", "不错", "棒", "good job", "well done", "nice work"),
+             "谢谢！还需要我做点什么吗？", "Thank you. What else can I help with?"),
+            (("谢谢", "感谢", "thank you", "thanks"),
+             "不客气。还需要我做点什么吗？", "You're welcome. What else can I help with?"),
+            (("你好", "嗨", "hello", "hi there"),
+             "你好！有什么可以帮你处理的吗？", "Hello. What can I help you with?"),
+        )
+        for phrases, chinese_reply, english_reply in replies:
+            if any(phrase in text for phrase in phrases):
+                return chinese_reply if chinese else english_reply
+        return None
+
+    @staticmethod
+    def _is_weather_question(text: str) -> bool:
+        return any(phrase in text for phrase in (
+            "天气", "气温", "温度", "下雨", "weather", "temperature", "rain",
+        ))
+
+    @classmethod
+    def _weather_reply(cls, location: str, timeout_sec: float, chinese: bool) -> str:
+        try:
+            weather = cls._fetch_current_weather(location, timeout_sec)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return (
+                f"暂时无法获取{location}的实时天气，请稍后再试。"
+                if chinese else f"I can't retrieve the current weather for {location} right now."
+            )
+        if chinese:
+            return (
+                f"{weather['location']}当前{weather['condition']}，{weather['temperature']:.0f}°C，"
+                f"体感{weather['apparent_temperature']:.0f}°C。"
+            )
+        return (
+            f"Current weather in {weather['location']}: {weather['condition']}, "
+            f"{weather['temperature']:.0f}°C (feels like {weather['apparent_temperature']:.0f}°C)."
+        )
+
+    @staticmethod
+    def _fetch_current_weather(location: str, timeout_sec: float) -> dict[str, Any]:
+        """Fetch current conditions from Open-Meteo's public, keyless API."""
+        geocode_query = urlencode({"name": location, "count": 1, "language": "en", "format": "json"})
+        with urlopen(
+            f"https://geocoding-api.open-meteo.com/v1/search?{geocode_query}",
+            timeout=timeout_sec,
+        ) as response:
+            places = json.load(response).get("results", [])
+        if not places:
+            raise ValueError(f"No weather location found for {location!r}.")
+        place = places[0]
+        forecast_query = urlencode({
+            "latitude": place["latitude"], "longitude": place["longitude"],
+            "current": "temperature_2m,apparent_temperature,weather_code",
+        })
+        with urlopen(
+            f"https://api.open-meteo.com/v1/forecast?{forecast_query}", timeout=timeout_sec
+        ) as response:
+            current = json.load(response)["current"]
+        return {
+            "location": place["name"],
+            "temperature": float(current["temperature_2m"]),
+            "apparent_temperature": float(current["apparent_temperature"]),
+            "condition": ExistingAgentBridge._weather_condition(current["weather_code"]),
+        }
+
+    @staticmethod
+    def _weather_condition(code: int) -> str:
+        return {
+            0: "晴朗", 1: "大部晴朗", 2: "局部多云", 3: "阴天",
+            45: "有雾", 48: "雾凇", 51: "毛毛雨", 53: "毛毛雨", 55: "毛毛雨",
+            61: "小雨", 63: "中雨", 65: "大雨", 71: "小雪", 73: "中雪", 75: "大雪",
+            80: "阵雨", 81: "阵雨", 82: "强阵雨", 95: "雷暴",
+        }.get(int(code), "天气状况未知")
 
     @staticmethod
     def capabilities_message(*, real_execution_enabled: bool = False) -> str:

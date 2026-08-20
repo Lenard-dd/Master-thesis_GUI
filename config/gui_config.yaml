@@ -28,6 +28,11 @@ agent_bridge:
   mode: "existing_openai"  # existing_scripted, existing_openai, or mock
   timeout_sec: 15
   execution_mode: "plan_only"
+  conversation:
+    enabled: true
+    # Used only for weather questions. Change this to the operator's city.
+    weather_location: "Berlin, Germany"
+    weather_timeout_sec: 3.0
 runtime_backends:
   # "mock" is deterministic and intended for short demonstrations.
   # Set perception_mode to "ros" only after D435i/SAM3 ROS health is 2READY;
