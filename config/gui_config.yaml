@@ -30,7 +30,7 @@ agent_bridge:
   execution_mode: "plan_only"
 runtime_backends:
   # "mock" is deterministic and intended for short demonstrations.
-  # Set perception_mode to "ros" only after D435i/SAM3 ROS health is READY;
+  # Set perception_mode to "ros" only after D435i/SAM3 ROS health is 2READY;
   # set grasp_mode to "graspgenx" only after the GUI-managed server is running.
   # A requested live backend never falls back to fabricated mock observations.
   perception_mode: "mock"  # mock | ros
@@ -79,8 +79,8 @@ simulation_motion:
   # Used only while the GUI runs in SIMULATION mode. These values determine
   # MoveIt's trajectory timing, so RViz previews and fake-hardware execution
   # move at the same speed. Real-robot limits are intentionally unaffected.
-  velocity_scale: 0.10
-  acceleration_scale: 0.10
+  velocity_scale: 0.30
+  acceleration_scale: 0.30
 system_launcher:
   ros_domain_id: 27
   workspace_path: "/home/lenard/dev_ws"

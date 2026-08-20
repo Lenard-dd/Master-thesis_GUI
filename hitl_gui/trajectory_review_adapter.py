@@ -37,8 +37,8 @@ class ExistingTrajectoryReviewAdapter:
         validator,
         visualizer=None,
         *,
-        named_velocity_scale: float = 0.03,
-        named_acceleration_scale: float = 0.03,
+        named_velocity_scale: float = 0.10,
+        named_acceleration_scale: float = 0.10,
     ) -> None:
         self.backend = backend
         self.validator = validator
