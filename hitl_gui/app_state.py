@@ -158,6 +158,11 @@ class AppState:
     agent_status: SystemComponentStatus = SystemComponentStatus.IDLE
     conversation: list[ChatEntry] = field(default_factory=list)
     tool_nodes: list[ToolNode] = field(default_factory=list)
+    # Scene semantics are useful context between tasks. Keep only the latest
+    # completed, explicitly unverified result; it is never a manipulation
+    # target and is replaced only by a later successful scene scan.
+    latest_scene_description: dict[str, Any] | None = None
+    latest_scene_image_path: str | None = None
     hardware_status: dict[str, SystemComponentStatus] = field(default_factory=dict)
     pending_hitl_request: HitlRequest | None = None
     current_trajectory_id: str | None = None

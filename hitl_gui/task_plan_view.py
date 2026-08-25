@@ -124,6 +124,17 @@ def node_summary(node: TaskNode) -> str:
         count = _first(data, "detected_count", "object_count", "count")
         if count is not None:
             return f"{count} object{'s' if count != 1 else ''} found"
+    if tool == "describe_scene":
+        description = data.get("scene_description")
+        if isinstance(description, dict):
+            summary = description.get("summary")
+            candidates = description.get("candidate_objects")
+            if summary:
+                suffix = (
+                    f" · {len(candidates)} unverified candidate(s)"
+                    if isinstance(candidates, list) else ""
+                )
+                return f"{summary}{suffix}"
     if tool == "select_target":
         target = _first(data, "target_id", "object_id", "target", "label", "name")
         confidence = _first(data, "confidence", "score")

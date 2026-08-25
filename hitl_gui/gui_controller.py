@@ -37,6 +37,7 @@ from hitl_gui.panels.tool_flow_panel import create_tool_flow_panel
 from hitl_gui.panels.component_log_panel import create_component_log_panel
 from hitl_gui.panels.task_summary_panel import create_task_summary_panel
 from hitl_gui.panels.embedded_rviz_panel import EmbeddedRvizPanel
+from hitl_gui.panels.visual_perception_panel import VisualPerceptionPanel
 
 
 FLOW = [
@@ -129,34 +130,47 @@ class GuiController:
             renderers = []
             # Keep conversation focused but leave the primary workspace for
             # the task tree and its live RViz trajectory preview.
-            with ui.splitter(value=24).classes("w-full flex-grow min-h-[720px]") as outer:
+            # Top workspace: operator intent/review and its corresponding
+            # execution views share one deliberate horizontal boundary.
+            with ui.splitter(value=24).classes("w-full min-h-[650px]") as outer:
                 with outer.before:
                     with ui.column().classes("w-full h-full gap-4 pr-2"):
                         chat_renderer = create_chat_panel(self)
                         hitl_renderer = create_hitl_panel(self)
                 with outer.after:
                     with ui.column().classes("w-full h-full gap-3 pl-2"):
-                        # Planning steps and the 3D trajectory view remain
-                        # side-by-side so an operator can correlate them.
-                        with ui.splitter(value=50).classes("w-full min-h-[700px]") as inner:
+                        # Keep 3D RViz wider than the compact plan/evidence
+                        # column. It stays usable throughout manipulation.
+                        with ui.splitter(value=44).classes("w-full min-h-[650px]") as inner:
                             with inner.before:
-                                tool_flow_renderer = create_tool_flow_panel(self)
+                                with ui.column().classes("w-full gap-3"):
+                                    tool_flow_renderer = create_tool_flow_panel(self)
                             with inner.after:
                                 embedded_rviz_renderer = EmbeddedRvizPanel(
                                     self.embedded_rviz_manager,
                                     self.gui_config.get("embedded_rviz", {}).get("iframe_url", ""),
                                     open_native_rviz=self.start_rviz,
                                 ).render()
-                        # Status is useful context, but should not take a
-                        # permanent vertical sidebar away from the task tree.
-                        renderers.append(create_status_panel(self, compact=True))
+            # Bottom workspace: System and Scene begin on exactly the same
+            # horizontal line. Their widths are intentionally independent of
+            # the narrow Chat/HITL column above.
+            with ui.splitter(value=29).classes("w-full items-start") as lower:
+                with lower.before:
+                    with ui.column().classes("w-full pr-2"):
+                        status_renderer = create_status_panel(self, compact=True)
+                with lower.after:
+                    with ui.column().classes("w-full pl-2"):
+                        visual_perception_renderer = VisualPerceptionPanel(self).render()
+            renderers.extend([status_renderer, visual_perception_renderer])
             # Audit log updates are event-driven. Keeping it out of the ROS
             # monitor's 5 Hz renderer list preserves pagination and selection.
             self._log_renderer = create_log_panel(self)
             task_summary_renderer = create_task_summary_panel(self)
             component_log_renderer = create_component_log_panel(self)
         self._event_renderers = [header_renderer.refresh, chat_renderer, tool_flow_renderer, hitl_renderer,
-                                 embedded_rviz_renderer, task_summary_renderer]
+                                 status_renderer,
+                                 embedded_rviz_renderer, visual_perception_renderer,
+                                 task_summary_renderer]
         # Header contains ROS state, while component output arrives from child
         # processes. They need periodic updates, but not monitor-frequency UI
         # reconstruction.
@@ -198,7 +212,10 @@ class GuiController:
         self.refresh_component_processes()
         self.consume_ros_status()
         for renderer in renderers:
-            renderer.refresh()
+            # Most existing panels provide ``.refresh``; the scene panel
+            # returns its refresh callback directly.
+            refresh = getattr(renderer, "refresh", renderer)
+            refresh()
 
     def start_task(self, task_name: str) -> str | None:
         task_name = task_name.strip()
@@ -336,6 +353,12 @@ class GuiController:
                                     "approval_stages": event.approval_stages})
         if node.requires_approval and event.approval_stages:
             self.create_agent_hitl_request(node, event.approval_stages)
+        elif node.tool_name == "describe_scene":
+            # The Agent marks describe_scene as a read-only observation. Start
+            # it automatically without creating a HITL approval request.
+            self._last_skill_task = asyncio.create_task(
+                self.skill_runtime.run_scene_description(node)
+            )
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
@@ -1251,6 +1274,10 @@ class GuiController:
                 target = node.input_data.get("target_name") or node.input_data.get("target")
                 if target:
                     self.request_named_target_trajectory(str(target), source_node_id=node.node_id)
+            elif node and node.tool_name == "describe_scene" and request.request_type == "task_intent":
+                self._last_skill_task = asyncio.create_task(
+                    self.skill_runtime.run_scene_description(node)
+                )
             elif node and node.tool_name in {"safe_pick_object", "safe_pick"} and request.request_type == "task_intent":
                 # This runs only sensor/grasp proposal stages.  It does not
                 # invoke MoveIt or any gripper/robot command.

@@ -55,6 +55,70 @@ class GuiSkillRuntimeAdapter:
         )
         self._request_named_motion(parent, "observe", "Move To Observe")
 
+    async def run_scene_description(self, node: ToolNode) -> None:
+        """Execute the approved read-only scene-description skill.
+
+        This captures RGB and queries the configured vision-language model.  It
+        never invokes SAM3, MoveIt, a gripper, or an arm command.
+        """
+        task_id = self.controller.state.current_task_id
+        if not task_id or task_id in self._cancelled_task_ids:
+            return
+        context = {"task_id": task_id}
+        self.controller.state.task_status = TaskStatus.PERCEIVING
+        self.controller.update_tool_status(node.node_id, ToolStatus.RUNNING)
+        step = _new_plan_step(
+            node.node_id,
+            "describe_scene",
+            node.display_name or "Describe Scene",
+            dict(node.input_data),
+        )
+        try:
+            result = await asyncio.to_thread(self.adapters.execute, step, context)
+        except Exception as exc:
+            result = {"success": False, "message": f"describe_scene failed: {exc}", "output": {}}
+
+        output = result.get("output", {}) if isinstance(result, dict) else {}
+        output = output if isinstance(output, dict) else {"raw_output": output}
+        if not bool(result.get("success", False)):
+            message = str(result.get("message", "Scene description failed."))
+            self.controller.update_tool_status(
+                node.node_id, ToolStatus.FAILED,
+                output_summary=output, error_message=message,
+            )
+            self.controller.state.task_status = TaskStatus.FAILED
+            self.controller.add_chat_message(message, sent=False, name="System")
+            return
+
+        description = output.get("scene_description")
+        summary = description.get("summary") if isinstance(description, dict) else None
+        candidates = description.get("candidate_objects") if isinstance(description, dict) else None
+        if isinstance(description, dict):
+            # Do not clear this at task boundaries. During a subsequent scan
+            # the panel keeps this last successful semantic result while the
+            # RGB capture updates its image evidence.
+            self.controller.state.latest_scene_description = dict(description)
+        image_path = output.get("image_path")
+        if isinstance(image_path, str):
+            self.controller.state.latest_scene_image_path = image_path
+        self.controller.update_tool_status(
+            node.node_id,
+            ToolStatus.SUCCEEDED,
+            scene_description=description,
+            image_path=image_path,
+            output_summary={
+                "summary": summary,
+                "candidate_count": len(candidates) if isinstance(candidates, list) else 0,
+                "verified_for_manipulation": False,
+            },
+        )
+        self.controller.state.task_status = TaskStatus.COMPLETED
+        self.controller.add_chat_message(
+            _format_scene_description(description),
+            sent=False,
+            name="System",
+        )
+
     def on_motion_execution_completed(
         self, motion_node_id: str, review_node_id: str | None = None,
     ) -> None:
@@ -768,6 +832,24 @@ def _minimum_tabletop_clearance(result: dict[str, Any]) -> float | None:
 def _new_plan_step(step_id: str, skill_id: str, description: str, parameters: dict[str, Any]):
     from llm_skill_robot.core.plan import PlanStep
     return PlanStep(step_id=step_id, skill_id=skill_id, description=description, parameters=parameters)
+
+
+def _format_scene_description(description: Any) -> str:
+    """Make the read-only scene result skimmable in the chat panel."""
+    if not isinstance(description, dict):
+        return "Scene description completed, but no structured description was returned."
+    candidates = [
+        str(item.get("query"))
+        for item in description.get("candidate_objects", [])
+        if isinstance(item, dict) and item.get("query")
+    ]
+    candidate_text = ", ".join(candidates[:4]) or "no clear candidates"
+    extra = f" (+{len(candidates) - 4} more)" if len(candidates) > 4 else ""
+    return (
+        f"Scene scan complete: {description.get('scene_type', 'unknown')}. "
+        f"Candidates: {candidate_text}{extra}. "
+        "See Scene & 2D Perception for details; localize with SAM3 + RGB-D before manipulation."
+    )
 
 
 def _query_from_parent(parent: ToolNode, fallback: str) -> str:

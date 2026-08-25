@@ -332,6 +332,8 @@ class ExistingAgentBridge:
             composites = set()
 
         items = []
+        if "describe_scene" in tools:
+            items.append("describe the current scene and propose unverified object candidates")
         if "detect_object" in tools:
             items.append("observe or detect a specified object")
         if "safe_pick_object" in composites:

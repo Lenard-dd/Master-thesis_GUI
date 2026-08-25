@@ -17,15 +17,17 @@ def create_status_panel(controller, *, compact: bool = False):
         ("sam3", "SAM3", None),
     ]
 
+    grid_classes = (
+        "w-full grid grid-cols-1 sm:grid-cols-2 gap-2"
+        if compact else "w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-2"
+    )
     with ui.card().classes(card_classes):
         with ui.row().classes("w-full items-center justify-between gap-2"):
             ui.label("System").classes("text-base font-semibold")
             with ui.row().classes("items-center gap-2"):
                 ui.label(f"{controller.runtime_adapters.mode_summary}").classes("text-[10px] text-grey-6")
                 launcher_label = ui.badge("IDLE", color="grey-7").props("outline").classes("text-[9px]")
-        with ui.element("div").classes(
-            "w-full grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4 gap-2"
-        ):
+        with ui.element("div").classes(grid_classes):
             for component_id, display_name, _health_name in rows:
                 with ui.element("div").classes(
                     "w-full min-w-0 px-2 py-1.5 rounded border-l-4 border-grey-4 bg-grey-1"

@@ -14,6 +14,7 @@ from hitl_gui.robot_config import load_grasping_config
 
 
 SENSOR_SKILLS = {
+    "describe_scene",
     "detect_object",
     "build_object_point_cloud",
     "generate_grasp_pose",
@@ -97,7 +98,7 @@ class ExistingRosSensorGraspAdapter:
     def execute(self, step, context: dict[str, Any]) -> dict[str, Any]:
         from llm_skill_robot.ros_nl_rviz_sim_demo import execute_non_motion_skill
 
-        if step.skill_id in {"detect_object", "build_object_point_cloud"} and self._config.perception_mode != "ros":
+        if step.skill_id in {"describe_scene", "detect_object", "build_object_point_cloud"} and self._config.perception_mode != "ros":
             return _failure(step, "Live perception is disabled by runtime_backends.perception_mode.")
         if step.skill_id == "generate_grasp_pose" and self._config.grasp_mode != "graspgenx":
             return _failure(step, "Live GraspGenX is disabled by runtime_backends.grasp_mode.")
@@ -127,6 +128,11 @@ class RuntimeAdapterRegistry:
     def execute(self, step, context: dict[str, Any]) -> dict[str, Any]:
         if step.skill_id not in SENSOR_SKILLS:
             return _failure(step, f"Runtime adapter does not handle {step.skill_id}.")
+        if step.skill_id == "describe_scene" and self.config.perception_mode != "ros":
+            return _failure(
+                step,
+                "describe_scene requires runtime_backends.perception_mode=ros; mock mode does not fabricate LLM scene descriptions.",
+            )
         if step.skill_id == "generate_grasp_pose":
             live_requested = self.config.grasp_mode == "graspgenx"
         else:

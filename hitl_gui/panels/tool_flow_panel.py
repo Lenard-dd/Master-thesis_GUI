@@ -48,7 +48,9 @@ def create_tool_flow_panel(controller):
         details_column.set_visibility(False)
         task_flow.refresh()
 
-    with ui.card().classes("w-full h-full min-h-[520px] p-3"):
+    # Reserve a meaningful initial workspace for a growing multi-step plan;
+    # the inner list remains scrollable after it reaches this size.
+    with ui.card().classes("w-full min-h-[650px] p-3"):
         ui.label("Agent Execution Flow").classes("text-lg font-semibold")
 
         @ui.refreshable
@@ -179,7 +181,7 @@ def create_tool_flow_panel(controller):
             with ui.column().classes("w-full min-w-0"):
                 # Keep the scroll container stable while refreshable rebuilds
                 # only its contents; this preserves its scroll position.
-                with ui.scroll_area().classes("w-full h-[65vh] min-h-[420px] max-h-[720px]") as task_scroll:
+                with ui.scroll_area().classes("w-full h-[50vh] min-h-[500px] max-h-[620px]") as task_scroll:
                     task_flow()
             with ui.column().classes("w-full min-w-0 2xl:sticky 2xl:top-2") as details_column:
                 details_panel()

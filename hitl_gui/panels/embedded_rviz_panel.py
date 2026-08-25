@@ -31,7 +31,7 @@ class EmbeddedRvizPanel:
         self._iframe = self._status = self._message = None
 
     def render(self) -> Callable[[], None]:
-        with ui.card().classes("w-full p-3"):
+        with ui.card().classes("w-full min-h-[650px] p-3"):
             with ui.row().classes("w-full items-center justify-between"):
                 ui.label("Embedded RViz").classes("text-h6")
                 self._status = ui.badge("STOPPED", color="grey")
@@ -47,7 +47,7 @@ class EmbeddedRvizPanel:
             # The URL is read exclusively from gui_config.yaml. NiceGUI's
             # default DOMPurify policy strips iframe tags, so it must be
             # disabled for this fixed, localhost-only trusted markup.
-            self._iframe = ui.html("", sanitize=False).classes("w-full mt-2").style("aspect-ratio: 16 / 9;")
+            self._iframe = ui.html("", sanitize=False).classes("w-full mt-2").style("height: 500px;")
         self._refresh()
         ui.timer(1.0, self._refresh)
         return self._refresh
@@ -110,6 +110,7 @@ class EmbeddedRvizPanel:
         self._message.update()
         if self._iframe is not None:
             content = self._iframe_html() if status == "RUNNING" else ""
+            self._iframe.visible = status == "RUNNING"
             if self._iframe.content != content:
                 self._iframe.content = content
                 self._iframe.update()

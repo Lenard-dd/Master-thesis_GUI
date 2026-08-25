@@ -16,6 +16,7 @@ PHASE_ORDER = {phase: index for index, phase in enumerate(PHASES)}
 TOOL_PHASE = {
     "understand_instruction": "understanding",
     "safe_pick_object": "understanding",
+    "describe_scene": "perception",
     "detect_object": "perception",
     "detect_objects": "perception",
     "build_object_point_cloud": "perception",
