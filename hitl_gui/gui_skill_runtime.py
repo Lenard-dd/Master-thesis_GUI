@@ -126,6 +126,64 @@ class GuiSkillRuntimeAdapter:
             report += " To analyze the scene again, ask me to describe or scan the scene."
         self.controller.add_chat_message(report, sent=False, name=reporter_name)
 
+    async def run_object_localization(self, node: ToolNode) -> None:
+        """Execute one approved read-only SAM3 + RGB-D localization skill."""
+        task_id = self.controller.state.current_task_id
+        if not task_id or task_id in self._cancelled_task_ids:
+            return
+
+        skill_id = node.tool_name
+        if skill_id not in {"detect_object", "detect_objects"}:
+            return
+        context = {"task_id": task_id}
+        self.controller.state.task_status = TaskStatus.PERCEIVING
+        self.controller.update_tool_status(node.node_id, ToolStatus.RUNNING)
+        step = _new_plan_step(
+            node.node_id,
+            skill_id,
+            node.display_name or skill_id.replace("_", " ").title(),
+            dict(node.input_data),
+        )
+        try:
+            result = await asyncio.to_thread(self.adapters.execute, step, context)
+        except Exception as exc:
+            result = {
+                "success": False,
+                "message": f"{skill_id} failed: {exc}",
+                "output": {},
+            }
+
+        output = result.get("output", {}) if isinstance(result, dict) else {}
+        output = output if isinstance(output, dict) else {"raw_output": output}
+        if not bool(result.get("success", False)):
+            message = str(result.get("message", "Object localization failed."))
+            self.controller.update_tool_status(
+                node.node_id,
+                ToolStatus.FAILED,
+                output_summary=output,
+                error_message=message,
+            )
+            self.controller.state.task_status = TaskStatus.FAILED
+            self.controller.state.agent_status = SystemComponentStatus.IDLE
+            self.controller.add_chat_message(message, sent=False, name="System")
+            return
+
+        objects = output.get("objects", [])
+        objects = objects if isinstance(objects, list) else []
+        query_results = output.get("query_results", [])
+        self.controller.update_tool_status(
+            node.node_id,
+            ToolStatus.SUCCEEDED,
+            output_summary=output,
+        )
+        self.controller.state.task_status = TaskStatus.COMPLETED
+        self.controller.state.agent_status = SystemComponentStatus.IDLE
+        self.controller.add_chat_message(
+            _format_localization_report(objects, query_results),
+            sent=False,
+            name="System",
+        )
+
     def on_motion_execution_completed(
         self, motion_node_id: str, review_node_id: str | None = None,
     ) -> None:
@@ -857,6 +915,27 @@ def _format_scene_description(description: Any) -> str:
         f"Candidates: {candidate_text}{extra}. "
         "See Scene & 2D Perception for details; localize with SAM3 + RGB-D before manipulation."
     )
+
+
+def _format_localization_report(objects: list[Any], query_results: Any) -> str:
+    """Return a compact, truthful summary of a localization result."""
+    labels = [
+        str(item.get("label") or item.get("object_id"))
+        for item in objects
+        if isinstance(item, dict) and (item.get("label") or item.get("object_id"))
+    ]
+    found = ", ".join(dict.fromkeys(labels)) or "no objects"
+    missing = []
+    if isinstance(query_results, list):
+        missing = [
+            str(item.get("query"))
+            for item in query_results
+            if isinstance(item, dict) and item.get("status") == "NOT_FOUND" and item.get("query")
+        ]
+    report = f"Localization complete: {len(objects)} object(s) found ({found})."
+    if missing:
+        report += f" Not found: {', '.join(missing)}."
+    return report + " See Scene & 2D Perception for SAM3 overlay and localization details."
 
 
 def _query_from_parent(parent: ToolNode, fallback: str) -> str:

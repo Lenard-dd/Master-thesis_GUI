@@ -73,34 +73,39 @@ class VisualPerceptionPanel:
     def _latest_evidence(self) -> tuple[dict[str, Any] | None, list[Path]]:
         cached_description = getattr(self.controller.state, "latest_scene_description", None)
         description = cached_description if isinstance(cached_description, dict) else None
-        image_paths: list[Path] = []
-        seen: set[Path] = set()
-        # The D435 backend overwrites this path for every capture. Retaining
-        # it lets the image refresh during a new scan without blanking the
-        # previous semantic description.
-        self._append_image(
-            getattr(self.controller.state, "latest_scene_image_path", None),
-            image_paths,
-            seen,
-        )
         nodes = reversed(getattr(self.controller.state, "tool_nodes", []))
         for node in nodes:
             output = {**getattr(node, "output_summary", {}), **getattr(node, "output_data", {})}
-            if getattr(node, "tool_name", "") == "describe_scene" and description is None:
-                value = output.get("scene_description")
-                if isinstance(value, dict):
-                    description = value
-                self._append_image(output.get("image_path"), image_paths, seen)
-            if getattr(node, "tool_name", "") == "detect_object":
-                self._append_image(output.get("image_path"), image_paths, seen)
+            tool_name = getattr(node, "tool_name", "")
+            if tool_name in {"detect_object", "detect_objects"}:
+                # A localization result is more useful than the unannotated
+                # RGB capture. Every detection shares one combined overlay,
+                # so this normally returns exactly one image.
+                overlays: list[Path] = []
+                seen: set[Path] = set()
                 for candidate in output.get("objects", []) or []:
                     metadata = candidate.get("metadata", {}) if isinstance(candidate, dict) else {}
-                    self._append_image(metadata.get("overlay_path"), image_paths, seen)
+                    self._append_image(metadata.get("overlay_path"), overlays, seen)
                 scene = output.get("scene", {})
                 for candidate in scene.get("objects", []) if isinstance(scene, dict) else []:
                     metadata = candidate.get("metadata", {}) if isinstance(candidate, dict) else {}
-                    self._append_image(metadata.get("overlay_path"), image_paths, seen)
-        return description, image_paths[:5]
+                    self._append_image(metadata.get("overlay_path"), overlays, seen)
+                return description, overlays[:1]
+            if tool_name == "describe_scene":
+                value = output.get("scene_description")
+                if description is None and isinstance(value, dict):
+                    description = value
+                image_paths: list[Path] = []
+                self._append_image(output.get("image_path"), image_paths, set())
+                return description, image_paths[:1]
+
+        image_paths: list[Path] = []
+        self._append_image(
+            getattr(self.controller.state, "latest_scene_image_path", None),
+            image_paths,
+            set(),
+        )
+        return description, image_paths[:1]
 
     @staticmethod
     def _append_image(value: Any, paths: list[Path], seen: set[Path]) -> None:

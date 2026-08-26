@@ -1278,6 +1278,13 @@ class GuiController:
                 self._last_skill_task = asyncio.create_task(
                     self.skill_runtime.run_scene_description(node)
                 )
+            elif node and node.tool_name in {"detect_object", "detect_objects"} and request.request_type == "task_intent":
+                # Object localization is a read-only perception operation.
+                # It still receives the task-intent gate because it creates
+                # geometry that may later be proposed as a manipulation target.
+                self._last_skill_task = asyncio.create_task(
+                    self.skill_runtime.run_object_localization(node)
+                )
             elif node and node.tool_name in {"safe_pick_object", "safe_pick"} and request.request_type == "task_intent":
                 # This runs only sensor/grasp proposal stages.  It does not
                 # invoke MoveIt or any gripper/robot command.
