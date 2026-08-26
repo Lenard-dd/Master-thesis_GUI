@@ -184,6 +184,50 @@ class GuiSkillRuntimeAdapter:
             name="System",
         )
 
+    async def run_place_pose_computation(self, node: ToolNode) -> None:
+        """Compute a relative place pose without planning or moving the robot."""
+        task_id = self.controller.state.current_task_id
+        if not task_id or task_id in self._cancelled_task_ids:
+            return
+        self.controller.state.task_status = TaskStatus.PLANNING
+        self.controller.update_tool_status(node.node_id, ToolStatus.RUNNING)
+        step = _new_plan_step(
+            node.node_id,
+            "compute_place_pose",
+            node.display_name or "Compute Relative Place Pose",
+            dict(node.input_data),
+        )
+        try:
+            result = await asyncio.to_thread(
+                self.adapters.execute, step, {"task_id": task_id}
+            )
+        except Exception as exc:
+            result = {
+                "success": False,
+                "message": f"compute_place_pose failed: {exc}",
+                "output": {},
+            }
+        output = result.get("output", {}) if isinstance(result, dict) else {}
+        output = output if isinstance(output, dict) else {"raw_output": output}
+        if not bool(result.get("success", False)):
+            message = str(result.get("message", "Place-pose computation failed."))
+            self.controller.update_tool_status(
+                node.node_id, ToolStatus.FAILED,
+                output_summary=output, error_message=message,
+            )
+            self.controller.state.task_status = TaskStatus.FAILED
+            self.controller.state.agent_status = SystemComponentStatus.IDLE
+            self.controller.add_chat_message(message, sent=False, name="System")
+            return
+        self.controller.update_tool_status(
+            node.node_id, ToolStatus.SUCCEEDED, output_summary=output,
+        )
+        self.controller.state.task_status = TaskStatus.COMPLETED
+        self.controller.state.agent_status = SystemComponentStatus.IDLE
+        self.controller.add_chat_message(
+            _format_place_pose_report(output), sent=False, name="System",
+        )
+
     def on_motion_execution_completed(
         self, motion_node_id: str, review_node_id: str | None = None,
     ) -> None:
@@ -936,6 +980,21 @@ def _format_localization_report(objects: list[Any], query_results: Any) -> str:
     if missing:
         report += f" Not found: {', '.join(missing)}."
     return report + " See Scene & 2D Perception for SAM3 overlay and localization details."
+
+
+def _format_place_pose_report(output: dict[str, Any]) -> str:
+    pose = output.get("target_pose", {})
+    if not isinstance(pose, dict):
+        return "Relative place pose computed. Review is required before any robot motion."
+    try:
+        position = f"({float(pose['x']):.3f}, {float(pose['y']):.3f}, {float(pose['z']):.3f}) m"
+    except (KeyError, TypeError, ValueError):
+        position = "an unavailable position"
+    relation = str(output.get("relation", "relative"))
+    return (
+        f"Plan-only {relation} place pose: {position} in {pose.get('frame', 'unknown')}. "
+        "No robot motion was commanded; review it before a future pick/place workflow."
+    )
 
 
 def _query_from_parent(parent: ToolNode, fallback: str) -> str:

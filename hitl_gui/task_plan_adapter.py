@@ -19,6 +19,7 @@ TOOL_PHASE = {
     "describe_scene": "perception",
     "detect_object": "perception",
     "detect_objects": "perception",
+    "compute_place_pose": "motion_planning",
     "build_object_point_cloud": "perception",
     "select_target": "target_selection",
     "review_grasp_candidate": "hitl_review",

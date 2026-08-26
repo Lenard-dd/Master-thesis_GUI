@@ -365,6 +365,10 @@ class GuiController:
             self._last_skill_task = asyncio.create_task(
                 self.skill_runtime.run_object_localization(node)
             )
+        elif node.tool_name == "compute_place_pose":
+            self._last_skill_task = asyncio.create_task(
+                self.skill_runtime.run_place_pose_computation(node)
+            )
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
