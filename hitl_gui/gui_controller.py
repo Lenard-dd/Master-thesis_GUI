@@ -359,6 +359,12 @@ class GuiController:
             self._last_skill_task = asyncio.create_task(
                 self.skill_runtime.run_scene_description(node)
             )
+        elif node.tool_name in {"detect_object", "detect_objects"}:
+            # SAM3 + RGB-D localization is also read-only. Its output can only
+            # become a manipulation target through a later reviewed workflow.
+            self._last_skill_task = asyncio.create_task(
+                self.skill_runtime.run_object_localization(node)
+            )
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
