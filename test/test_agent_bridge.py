@@ -11,6 +11,13 @@ def test_existing_agent_success_returns_structured_tool_event():
     assert response.tool_events[0].tool_name == "safe_pick_object"
 
 
+def test_scene_scan_typo_is_inferred_as_a_read_only_scene_description():
+    response = ExistingAgentBridge("existing_scripted").submit("scan the senario")
+
+    assert response.tool_events[0].tool_name == "describe_scene"
+    assert "read-only scene scan" in response.message
+
+
 def test_capability_question_returns_registered_skill_summary_without_a_task():
     response = ExistingAgentBridge("existing_openai").submit("What can you do?")
     assert response.tool_events == []

@@ -47,9 +47,9 @@ FLOW = [
 ]
 
 WELCOME_MESSAGES = (
-    "Hello, I am {agent_name}, your robot-task assistant. What would you like us to work on together today? You can also ask me what I can currently do.",
-    "Welcome back. I am {agent_name}, ready to help turn a robot task into a reviewed plan. What should we work on today? Ask about my current capabilities at any time.",
-    "Hi, I am {agent_name}. It is good to work with you. Tell me the robot task you have in mind, or ask ‘what can you do?’ to see the currently supported basics.",
+    "Hello, I am {agent_name}, your robot-task assistant. Before sending an operation or command, please start the required system in the System panel. What would you like us to work on together today?",
+    "Welcome back. I am {agent_name}. Before we work on a robot task, please start the required system in the System panel. Ask about my current capabilities at any time.",
+    "Hi, I am {agent_name}. Please start the required system in the System panel before issuing an operation or command. Then tell me the robot task you have in mind.",
 )
 
 TASK_STATUS_BY_TOOL = {
@@ -1743,6 +1743,51 @@ class GuiController:
                 self.state.simulation_launch_status = f"FAILED: {component_id}"
                 return
         self.state.simulation_launch_status = "COMPLETED"
+        self._start_initial_real_scene_scan()
+
+    def _start_initial_real_scene_scan(self) -> None:
+        """Run one read-only scene scan after the real stack is ready.
+
+        This deliberately creates a normal visible plan node, but it bypasses
+        the language planner: the post-start scan is a fixed safety-neutral
+        observation, never a robot motion or a SAM3 localization request.
+        """
+        self.reset_task(clear_conversation=False)
+        task_id = f"scene-startup-{uuid.uuid4().hex[:8]}"
+        self.state.current_task_id = task_id
+        self.state.current_task_name = "Initial real-hardware scene scan"
+        self.state.experiment_metrics = TaskExperimentMetrics(task_started_at=utc_now())
+        self.initialize_task_plan(task_id, self.state.current_task_name)
+        self.state.agent_status = SystemComponentStatus.RUNNING
+        node = ToolNode(
+            node_id=f"describe-scene-{uuid.uuid4().hex[:8]}",
+            parent_id=None,
+            tool_name="describe_scene",
+            display_name="Describe Scene",
+            status=ToolStatus.PENDING,
+            input_data={"source": "real_hardware_startup"},
+            plan_version=self.state.current_plan_version,
+        )
+        self.register_tool_node(
+            node,
+            description="Automatic read-only scene scan after real-hardware startup.",
+        )
+        self.append_event("automatic_scene_scan_started", node_id=node.node_id, metadata={
+            "trigger": "real_hardware_startup",
+            "tool_name": "describe_scene",
+        })
+        self.add_chat_message(
+            "Real hardware is ready. I am scanning the scene now.",
+            sent=False,
+            name=self.agent_name,
+        )
+        self._last_skill_task = asyncio.create_task(
+            self.skill_runtime.run_scene_description(
+                node,
+                reporter_name=self.agent_name,
+                include_rescan_hint=True,
+            )
+        )
 
     def stop_gui_managed_components(self):
         return asyncio.create_task(self._stop_gui_managed_components())

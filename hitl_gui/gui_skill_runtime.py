@@ -11,7 +11,7 @@ import asyncio
 import copy
 from typing import Any
 
-from hitl_gui.app_state import TaskStatus, ToolNode, ToolStatus
+from hitl_gui.app_state import SystemComponentStatus, TaskStatus, ToolNode, ToolStatus
 from hitl_gui.robot_config import load_grasping_config, load_tabletop_safety_config
 from hitl_gui.real_gripper_adapter import RealGripperRuntimeAdapter
 
@@ -55,7 +55,13 @@ class GuiSkillRuntimeAdapter:
         )
         self._request_named_motion(parent, "observe", "Move To Observe")
 
-    async def run_scene_description(self, node: ToolNode) -> None:
+    async def run_scene_description(
+        self,
+        node: ToolNode,
+        *,
+        reporter_name: str = "System",
+        include_rescan_hint: bool = False,
+    ) -> None:
         """Execute the approved read-only scene-description skill.
 
         This captures RGB and queries the configured vision-language model.  It
@@ -87,7 +93,8 @@ class GuiSkillRuntimeAdapter:
                 output_summary=output, error_message=message,
             )
             self.controller.state.task_status = TaskStatus.FAILED
-            self.controller.add_chat_message(message, sent=False, name="System")
+            self.controller.state.agent_status = SystemComponentStatus.IDLE
+            self.controller.add_chat_message(message, sent=False, name=reporter_name)
             return
 
         description = output.get("scene_description")
@@ -113,11 +120,11 @@ class GuiSkillRuntimeAdapter:
             },
         )
         self.controller.state.task_status = TaskStatus.COMPLETED
-        self.controller.add_chat_message(
-            _format_scene_description(description),
-            sent=False,
-            name="System",
-        )
+        self.controller.state.agent_status = SystemComponentStatus.IDLE
+        report = _format_scene_description(description)
+        if include_rescan_hint:
+            report += " To analyze the scene again, ask me to describe or scan the scene."
+        self.controller.add_chat_message(report, sent=False, name=reporter_name)
 
     def on_motion_execution_completed(
         self, motion_node_id: str, review_node_id: str | None = None,
