@@ -183,6 +183,10 @@ class GuiSkillRuntimeAdapter:
             sent=False,
             name="System",
         )
+        # A relative-place computation submitted with this localization task is
+        # a dependent, plan-only node.  Start it only after the RGB-D scene is
+        # now available to the shared perception pipeline.
+        self.controller.start_ready_agent_tool_dependents()
 
     async def run_place_pose_computation(self, node: ToolNode) -> None:
         """Compute a relative place pose without planning or moving the robot."""

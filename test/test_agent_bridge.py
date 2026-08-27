@@ -18,6 +18,20 @@ def test_scene_scan_typo_is_inferred_as_a_read_only_scene_description():
     assert "read-only scene scan" in response.message
 
 
+def test_relative_place_followup_uses_the_localization_query_order():
+    followup = ExistingAgentBridge._relative_place_followup(
+        "detect and compute a plan-only pose to place apple between black cube and white cube",
+        "detect_objects",
+        {"queries": ["apple", "black cube", "white cube"]},
+    )
+
+    assert followup == {
+        "source_id": "apple",
+        "relation": "between",
+        "reference_ids": ["black cube", "white cube"],
+    }
+
+
 def test_capability_question_returns_registered_skill_summary_without_a_task():
     response = ExistingAgentBridge("existing_openai").submit("What can you do?")
     assert response.tool_events == []

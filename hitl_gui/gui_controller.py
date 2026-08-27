@@ -353,7 +353,14 @@ class GuiController:
                                     "approval_stages": event.approval_stages})
         if node.requires_approval and event.approval_stages:
             self.create_agent_hitl_request(node, event.approval_stages)
-        elif node.tool_name == "describe_scene":
+        else:
+            self._start_ready_read_only_agent_tool(node)
+
+    def _start_ready_read_only_agent_tool(self, node: ToolNode) -> None:
+        """Dispatch a read-only Agent node only after its dependencies succeed."""
+        if node.status != ToolStatus.PENDING or not self._dependencies_succeeded(node):
+            return
+        if node.tool_name == "describe_scene":
             # The Agent marks describe_scene as a read-only observation. Start
             # it automatically without creating a HITL approval request.
             self._last_skill_task = asyncio.create_task(
@@ -369,6 +376,19 @@ class GuiController:
             self._last_skill_task = asyncio.create_task(
                 self.skill_runtime.run_place_pose_computation(node)
             )
+
+    def _dependencies_succeeded(self, node: ToolNode) -> bool:
+        """Whether every declared predecessor completed successfully."""
+        return all(
+            (dependency := self._node(dependency_id)) is not None
+            and dependency.status == ToolStatus.SUCCEEDED
+            for dependency_id in node.dependencies
+        )
+
+    def start_ready_agent_tool_dependents(self) -> None:
+        """Release pending read-only successors after a tool succeeds."""
+        for node in self.state.tool_nodes:
+            self._start_ready_read_only_agent_tool(node)
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))

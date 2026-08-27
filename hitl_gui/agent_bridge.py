@@ -89,8 +89,9 @@ class ExistingAgentBridge:
             call = decision.tool_call
             plan_step = proposal.plan_step
             arguments = self._normalise_tool_arguments(call.tool_name, call.arguments)
-            return AgentResponse(decision.message, [AgentToolEvent(
-                node_id=f"agent-{call.tool_name}-1", parent_id=None,
+            primary_node_id = f"agent-{call.tool_name}-1"
+            events = [AgentToolEvent(
+                node_id=primary_node_id, parent_id=None,
                 tool_name=call.tool_name, display_name=call.tool_name.replace("_", " ").title(),
                 status="waiting_approval" if proposal.requires_human_gate else "pending",
                 input_json=arguments,
@@ -99,7 +100,28 @@ class ExistingAgentBridge:
                 approval_stages=approval_stages,
                 description=plan_step.description if plan_step is not None else "",
                 node_type="tool",
-            )])
+                sequence_index=1,
+            )]
+            followup = self._relative_place_followup(instruction, call.tool_name, arguments)
+            if followup is not None:
+                events.append(AgentToolEvent(
+                    node_id="agent-compute_place_pose-2", parent_id=primary_node_id,
+                    tool_name="compute_place_pose", display_name="Compute Place Pose",
+                    status="pending", input_json=followup,
+                    description=(
+                        "Compute the requested plan-only relative placement pose "
+                        "from the newly localized objects."
+                    ),
+                    node_type="tool", phase="motion_planning", sequence_index=2,
+                    dependencies=[primary_node_id],
+                ))
+                message = (
+                    "I will first localize the requested objects from one RGB-D frame, "
+                    "then compute the plan-only relative placement pose."
+                )
+            else:
+                message = decision.message
+            return AgentResponse(message, events)
         if decision.kind == AgentDecisionKind.COMPOSITE_SKILL_CALL and decision.composite_skill_call:
             call = decision.composite_skill_call
             return AgentResponse(decision.message, [AgentToolEvent(
@@ -174,6 +196,44 @@ class ExistingAgentBridge:
             if isinstance(value, str) and value.strip().casefold() in {"home", "home position"}:
                 normalised[key] = "safe_home"
         return normalised
+
+    @staticmethod
+    def _relative_place_followup(
+        instruction: str, tool_name: str, arguments: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Build the deterministic second stage of a safe relative-place workflow.
+
+        The Agent remains responsible for grounding the requested object queries.
+        This bridge only composes the reviewed sequence once those exact queries
+        are available: localize first, then calculate a pose from trusted RGB-D
+        output.  It never adds a pick, place, or robot-motion action.
+        """
+        if tool_name != "detect_objects":
+            return None
+        queries = arguments.get("queries")
+        if not isinstance(queries, list) or not all(isinstance(query, str) and query.strip() for query in queries):
+            return None
+        text = " ".join(instruction.lower().split())
+        relation = None
+        expected_references = 0
+        if any(phrase in text for phrase in ("between", "middle of", "中间")):
+            relation, expected_references = "between", 2
+        elif any(phrase in text for phrase in ("right of", "right_of", "右边", "右侧")):
+            relation, expected_references = "right_of", 1
+        elif any(phrase in text for phrase in ("left of", "left_of", "左边", "左侧")):
+            relation, expected_references = "left_of", 1
+        elif any(phrase in text for phrase in ("on top of", "on_top_of", "stack", "叠放", "正上方")):
+            relation, expected_references = "on_top_of", 1
+        if relation is None or len(queries) != expected_references + 1:
+            return None
+        return {
+            # The localization tool uses the same user-grounded query strings
+            # as labels.  The spatial planner accepts them only when they
+            # resolve unambiguously in the newly created scene model.
+            "source_id": queries[0].strip(),
+            "relation": relation,
+            "reference_ids": [query.strip() for query in queries[1:]],
+        }
 
     @classmethod
     def short_conversation_response(
