@@ -991,9 +991,14 @@ def _format_place_pose_report(output: dict[str, Any]) -> str:
     except (KeyError, TypeError, ValueError):
         position = "an unavailable position"
     relation = str(output.get("relation", "relative"))
+    preview = output.get("rviz_preview", {})
+    preview_text = "RViz preview published." if isinstance(preview, dict) and preview.get("success") else (
+        f"RViz preview unavailable: {preview.get('message', 'not configured.')}"
+        if isinstance(preview, dict) else "RViz preview was not requested."
+    )
     return (
         f"Plan-only {relation} place pose: {position} in {pose.get('frame', 'unknown')}. "
-        "No robot motion was commanded; review it before a future pick/place workflow."
+        f"{preview_text} No robot motion was commanded; review it before a future pick/place workflow."
     )
 
 

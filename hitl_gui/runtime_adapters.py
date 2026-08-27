@@ -84,12 +84,14 @@ class ExistingRosSensorGraspAdapter:
             create_perception_pipeline,
             load_perception_config,
         )
+        from llm_skill_robot.perception.relative_place_visualizer import RelativePlaceVisualizer
         from llm_skill_robot.grasping.graspgenx_grasp_planner import GraspGenXGraspPlanner
         from llm_skill_robot.grasping.graspgenx_subprocess_adapter import GraspGenXSubprocessAdapter
 
         self._config = config
         perception_config = load_perception_config()
         self._perception_pipeline = create_perception_pipeline(node=node, config=perception_config)
+        self._place_pose_visualizer = RelativePlaceVisualizer(node=node)
         grasp_document = load_grasping_config()
         grasp_config = grasp_document.get("grasping", grasp_document)
         self._point_cloud_builder = ObjectPointCloudBuilder(grasp_config.get("point_cloud", {}))
@@ -111,6 +113,7 @@ class ExistingRosSensorGraspAdapter:
             perception_pipeline=self._perception_pipeline,
             point_cloud_builder=self._point_cloud_builder,
             grasp_planner=self._grasp_planner,
+            place_pose_visualizer=self._place_pose_visualizer,
         )
 
 
