@@ -32,6 +32,24 @@ def test_relative_place_followup_uses_the_localization_query_order():
     }
 
 
+def test_all_objects_expands_to_the_latest_scene_candidates():
+    bridge = ExistingAgentBridge("existing_scripted")
+    bridge.record_scene_description({
+        "candidate_objects": [
+            {"query": "green apple"},
+            {"query": "black cube with number 3"},
+            {"query": "white cube with number 5"},
+        ]
+    })
+
+    response = bridge.submit("localize all the objects")
+
+    assert response.tool_events[0].tool_name == "detect_objects"
+    assert response.tool_events[0].input_json["queries"] == [
+        "green apple", "black cube with number 3", "white cube with number 5",
+    ]
+
+
 def test_semantic_relative_place_uses_persistent_verified_scene_only():
     bridge = ExistingAgentBridge(
         "existing_openai",

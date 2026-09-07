@@ -78,6 +78,7 @@ class GuiController:
         self._last_trajectory_task = None
         self._last_execution_task = None
         self._last_skill_task = None
+        self._pending_place_pose_plan: dict[str, Any] | None = None
         self._real_gripper_confirmed_nodes: set[str] = set()
         self.last_decision_error: str | None = None
         self._last_ros_worker_error: str | None = None
@@ -330,6 +331,28 @@ class GuiController:
     def record_agent_localization(self, output: dict[str, Any]) -> None:
         """Persist only verified localized-object identities for Agent grounding."""
         self.agent_bridge.record_localization_result(output)
+
+    def record_agent_scene_description(self, description: dict[str, Any]) -> None:
+        """Persist unverified VLM candidate queries for a later bulk localization."""
+        self.agent_bridge.record_scene_description(description)
+
+    def record_agent_place_pose(self, output: dict[str, Any]) -> None:
+        """Keep the latest verified plan-only object placement for a later pick."""
+        required = ("source_object_id", "source_pose", "target_pose")
+        if all(key in output for key in required):
+            self._pending_place_pose_plan = dict(output)
+
+    def pending_place_pose_for_query(self, query: str) -> dict[str, Any] | None:
+        plan = self._pending_place_pose_plan
+        if not isinstance(plan, dict):
+            return None
+        needle = " ".join(str(query).casefold().replace("_", " ").split())
+        candidates = (str(plan.get("source_object_id", "")), str(plan.get("source_label", "")))
+        if any(needle and (needle in " ".join(value.casefold().replace("_", " ").split()) or
+                           " ".join(value.casefold().replace("_", " ").split()) in needle)
+                   for value in candidates if value):
+            return dict(plan)
+        return None
 
     def add_agent_tool_event(self, event) -> None:
         status_map = {

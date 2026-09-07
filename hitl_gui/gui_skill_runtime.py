@@ -45,7 +45,11 @@ class GuiSkillRuntimeAdapter:
         self._cancelled_task_ids.discard(task_id)
         self._parents[task_id] = parent.node_id
         self._last_node_ids[task_id] = parent.node_id
-        self._contexts[task_id] = {"task_id": task_id, "query": _query_from_parent(parent, self.controller.state.current_task_name)}
+        query = _query_from_parent(parent, self.controller.state.current_task_name)
+        self._contexts[task_id] = {"task_id": task_id, "query": query}
+        pending_place = self.controller.pending_place_pose_for_query(str(query))
+        if pending_place is not None:
+            self._contexts[task_id]["pending_place_pose_plan"] = pending_place
         parent.status = ToolStatus.RUNNING
         self.controller.register_tool_node(parent, append_legacy=False)
         self.controller.state.task_status = TaskStatus.PLANNING
@@ -105,6 +109,7 @@ class GuiSkillRuntimeAdapter:
             # the panel keeps this last successful semantic result while the
             # RGB capture updates its image evidence.
             self.controller.state.latest_scene_description = dict(description)
+            self.controller.record_agent_scene_description(description)
         image_path = output.get("image_path")
         if isinstance(image_path, str):
             self.controller.state.latest_scene_image_path = image_path
@@ -232,6 +237,7 @@ class GuiSkillRuntimeAdapter:
         )
         self.controller.state.task_status = TaskStatus.COMPLETED
         self.controller.state.agent_status = SystemComponentStatus.IDLE
+        self.controller.record_agent_place_pose(output)
         self.controller.add_chat_message(
             _format_place_pose_report(output), sent=False, name="System",
         )

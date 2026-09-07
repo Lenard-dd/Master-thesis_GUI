@@ -59,6 +59,7 @@ class ExistingAgentBridge:
         # intentionally not conversational memory: LLM language understanding
         # must never become a source of manipulable geometry.
         self._trusted_scene_objects: list[dict[str, Any]] = []
+        self._scene_candidate_queries: list[str] = []
         self._scene_lock = threading.RLock()
         self._semantic_intent_parser = semantic_intent_parser
 
@@ -90,9 +91,36 @@ class ExistingAgentBridge:
         with self._scene_lock:
             self._trusted_scene_objects = []
 
+    def record_scene_description(self, description: dict[str, Any]) -> None:
+        """Store the newest VLM candidate queries as unverified localization hints.
+
+        They are never treated as poses or targets.  They merely let a later
+        request such as "localize all candidates" expand to one SAM3 query per
+        candidate rather than querying the literal phrase "all objects".
+        """
+        raw_candidates = description.get("candidate_objects", []) if isinstance(description, dict) else []
+        queries: list[str] = []
+        seen: set[str] = set()
+        if isinstance(raw_candidates, list):
+            for item in raw_candidates:
+                query = item.get("query") if isinstance(item, dict) else None
+                if not isinstance(query, str) or not query.strip():
+                    continue
+                cleaned = query.strip()
+                key = cleaned.casefold()
+                if key not in seen:
+                    seen.add(key)
+                    queries.append(cleaned)
+        with self._scene_lock:
+            self._scene_candidate_queries = queries
+
     def trusted_scene_objects(self) -> list[dict[str, Any]]:
         with self._scene_lock:
             return [dict(item) for item in self._trusted_scene_objects]
+
+    def scene_candidate_queries(self) -> list[str]:
+        with self._scene_lock:
+            return list(self._scene_candidate_queries)
 
     def submit(
         self,
@@ -111,6 +139,9 @@ class ExistingAgentBridge:
             return AgentResponse(conversation)
         if self.is_small_talk(instruction):
             return AgentResponse(self._llm_conversation_reply(instruction, conversation_config or {}))
+        candidate_response = self._scene_candidate_localization_response(instruction)
+        if candidate_response is not None:
+            return candidate_response
         semantic_response = self._semantic_relative_place_response(instruction)
         if semantic_response is not None:
             return semantic_response
@@ -181,6 +212,33 @@ class ExistingAgentBridge:
                 node_type="composite",
             )])
         return AgentResponse(decision.message)
+
+    def _scene_candidate_localization_response(self, instruction: str) -> AgentResponse | None:
+        """Expand 'all objects' into queries from the latest scene scan."""
+        text = " ".join(instruction.casefold().split())
+        asks_for_all = any(phrase in text for phrase in (
+            "all the objects", "all objects", "every object", "all candidates",
+            "all the candidates", "everything from the scan", "所有物体", "全部物体",
+            "所有目标", "全部目标", "所有候选", "全部候选",
+        ))
+        asks_for_localization = any(phrase in text for phrase in (
+            "localize", "localise", "detect", "identify", "find", "recognize", "recognise",
+            "定位", "识别", "检测", "找到",
+        ))
+        queries = self.scene_candidate_queries()
+        if not asks_for_all or not asks_for_localization or not queries:
+            return None
+        return AgentResponse(
+            f"I will localize the {len(queries)} unverified candidate(s) from the latest scene scan with SAM3 + RGB-D.",
+            [AgentToolEvent(
+                node_id="agent-detect_objects-1", parent_id=None,
+                tool_name="detect_objects", display_name="Localize Scene Candidates",
+                status="pending", input_json={"queries": queries},
+                requires_approval=False,
+                description="Localize every unverified candidate from the latest scene description.",
+                node_type="tool", phase="perception", sequence_index=1,
+            )],
+        )
 
     def _semantic_relative_place_response(self, instruction: str) -> AgentResponse | None:
         """Interpret flexible placement language, then ground it locally.
