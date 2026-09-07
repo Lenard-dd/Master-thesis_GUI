@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlencode
 from urllib.request import urlopen
 
@@ -48,8 +49,50 @@ class ExistingAgentBridge:
         "a robot task, say you can propose it for the normal reviewed workflow."
     )
 
-    def __init__(self, mode: str = "existing_scripted") -> None:
+    def __init__(
+        self,
+        mode: str = "existing_scripted",
+        semantic_intent_parser: Callable[[str, list[dict[str, Any]]], dict[str, Any] | None] | None = None,
+    ) -> None:
         self.mode = mode
+        # Populated only from successful RGB-D localization output. This is
+        # intentionally not conversational memory: LLM language understanding
+        # must never become a source of manipulable geometry.
+        self._trusted_scene_objects: list[dict[str, Any]] = []
+        self._scene_lock = threading.RLock()
+        self._semantic_intent_parser = semantic_intent_parser
+
+    def record_localization_result(self, output: dict[str, Any]) -> None:
+        """Replace memory with the latest verified, pose-bearing scene objects."""
+        scene = output.get("scene") if isinstance(output, dict) else None
+        objects = scene.get("objects", []) if isinstance(scene, dict) else []
+        trusted: list[dict[str, Any]] = []
+        if isinstance(objects, list):
+            for item in objects:
+                if not isinstance(item, dict):
+                    continue
+                object_id, label = item.get("object_id"), item.get("label")
+                if not isinstance(object_id, str) or not object_id.strip():
+                    continue
+                if not isinstance(label, str) or not label.strip():
+                    continue
+                if not item.get("pose_available") or not isinstance(item.get("pose"), dict):
+                    continue
+                # Deliberately retain no coordinates, images, masks, or clouds
+                # in the data sent to the semantic parser.
+                trusted.append({
+                    "object_id": object_id.strip(), "label": label.strip(), "pose_available": True,
+                })
+        with self._scene_lock:
+            self._trusted_scene_objects = trusted
+
+    def clear_localization_memory(self) -> None:
+        with self._scene_lock:
+            self._trusted_scene_objects = []
+
+    def trusted_scene_objects(self) -> list[dict[str, Any]]:
+        with self._scene_lock:
+            return [dict(item) for item in self._trusted_scene_objects]
 
     def submit(
         self,
@@ -68,6 +111,9 @@ class ExistingAgentBridge:
             return AgentResponse(conversation)
         if self.is_small_talk(instruction):
             return AgentResponse(self._llm_conversation_reply(instruction, conversation_config or {}))
+        semantic_response = self._semantic_relative_place_response(instruction)
+        if semantic_response is not None:
+            return semantic_response
         try:
             from llm_skill_robot.agent.agent_controller import AgentController, AgentDecisionKind
             from llm_skill_robot.agent.agent_state import AgentState
@@ -135,6 +181,137 @@ class ExistingAgentBridge:
                 node_type="composite",
             )])
         return AgentResponse(decision.message)
+
+    def _semantic_relative_place_response(self, instruction: str) -> AgentResponse | None:
+        """Interpret flexible placement language, then ground it locally.
+
+        The LLM may choose a relation and identify an object from a minimal
+        catalog. The returned IDs are accepted only if they exactly match the
+        latest successful localization result.
+        """
+        if self.mode != "existing_openai" and self._semantic_intent_parser is None:
+            return None
+        objects = self.trusted_scene_objects()
+        try:
+            intent = (
+                self._semantic_intent_parser(instruction, objects)
+                if self._semantic_intent_parser is not None
+                else self._request_semantic_intent(instruction, objects)
+            )
+        except Exception:
+            # Preserve the previous AgentController path as a compatibility
+            # fallback whenever the semantic request is unavailable.
+            return None
+        if not isinstance(intent, dict):
+            return None
+        kind = str(intent.get("kind", "unknown"))
+        if kind not in {"relative_place", "localize_then_relative_place"}:
+            return None
+        try:
+            confidence = float(intent.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if bool(intent.get("needs_clarification")) or confidence < 0.65:
+            return AgentResponse(
+                "I can help plan that placement, but the object or spatial relation is ambiguous. "
+                "Please name the object to move and the reference object(s)."
+            )
+        relation = str(intent.get("relation", ""))
+        references = intent.get("references")
+        source = intent.get("source")
+        required_references = 2 if relation == "between" else 1
+        if relation not in {"between", "right_of", "left_of", "on_top_of"}:
+            return AgentResponse("I need a clearer relative placement relation before planning a pose.")
+        if not isinstance(source, str) or not source.strip() or not isinstance(references, list):
+            return AgentResponse("I need the object to move and its reference object(s) before planning a pose.")
+        references = [item.strip() for item in references if isinstance(item, str) and item.strip()]
+        if len(references) != required_references:
+            return AgentResponse(
+                "A between placement needs two reference objects; other relative placements need one reference object."
+            )
+
+        if kind == "relative_place":
+            source_id = self._resolve_trusted_object_id(source, objects)
+            reference_ids = [self._resolve_trusted_object_id(item, objects) for item in references]
+            if source_id is None or any(item is None for item in reference_ids):
+                return AgentResponse(
+                    "I cannot safely match that description to one localized object. "
+                    "Please name it more specifically or localize the scene again."
+                )
+            return AgentResponse(
+                "Using the current verified scene, I will compute a plan-only relative placement pose.",
+                [self._compute_place_event(source_id, relation, [str(item) for item in reference_ids])],
+            )
+
+        # The LLM supplies descriptions only. The dependent computation starts
+        # only after this new SAM3 + RGB-D localization succeeds.
+        queries = [source.strip(), *references]
+        detect_id = "agent-detect_objects-1"
+        return AgentResponse(
+            "I will first localize the requested objects from one RGB-D frame, then compute the plan-only relative placement pose.",
+            [
+                AgentToolEvent(
+                    node_id=detect_id, parent_id=None, tool_name="detect_objects",
+                    display_name="Localize Objects", status="pending", input_json={"queries": queries},
+                    requires_approval=False, description="Localize requested objects with SAM3 and RGB-D.",
+                    node_type="tool", phase="perception", sequence_index=1,
+                ),
+                AgentToolEvent(
+                    node_id="agent-compute_place_pose-2", parent_id=detect_id,
+                    tool_name="compute_place_pose", display_name="Compute Place Pose", status="pending",
+                    input_json={"source_id": queries[0], "relation": relation, "reference_ids": queries[1:]},
+                    description="Compute a plan-only relative placement pose from verified localization.",
+                    node_type="tool", phase="motion_planning", sequence_index=2, dependencies=[detect_id],
+                ),
+            ],
+        )
+
+    @staticmethod
+    def _compute_place_event(source_id: str, relation: str, reference_ids: list[str]) -> AgentToolEvent:
+        return AgentToolEvent(
+            node_id="agent-compute_place_pose-1", parent_id=None,
+            tool_name="compute_place_pose", display_name="Compute Place Pose", status="pending",
+            input_json={"source_id": source_id, "relation": relation, "reference_ids": reference_ids},
+            description="Compute a plan-only relative placement pose from the verified scene.",
+            node_type="tool", phase="motion_planning", sequence_index=1,
+        )
+
+    @staticmethod
+    def _resolve_trusted_object_id(identifier: str, objects: list[dict[str, Any]]) -> str | None:
+        needle = identifier.strip().casefold()
+        matches = [
+            item["object_id"] for item in objects
+            if needle in {str(item.get("object_id", "")).casefold(), str(item.get("label", "")).casefold()}
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def _request_semantic_intent(
+        self, instruction: str, objects: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        from llm_skill_robot.agent.llm_client import OpenAILLMClient
+
+        prompt = (
+            "You are a semantic parser for a robot plan-only relative placement request. "
+            "Return exactly one JSON object and no Markdown. Schema: "
+            '{"kind":"relative_place|localize_then_relative_place|unknown","source":"string",'
+            '"relation":"between|right_of|left_of|on_top_of","references":["string"],'
+            '"confidence":0.0,"needs_clarification":false}. '
+            "Interpret natural language flexibly: stack/atop/above means on_top_of; "
+            "to the right/left means right_of/left_of; midway/in the middle means between. "
+            "For relative_place, source and references MUST be exact object_id values from the trusted catalog, "
+            "and every object must be present. For localize_then_relative_place use concise object descriptions "
+            "as queries. between requires two references; other relations require one. "
+            "Do not infer coordinates, trajectories, grasps, or robot actions. "
+            f"Trusted catalog (no coordinates or images): {json.dumps(objects, ensure_ascii=False)}"
+        )
+        raw = OpenAILLMClient().generate_text([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": instruction},
+        ]).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
 
     @staticmethod
     def is_capability_question(instruction: str) -> bool:
@@ -222,7 +399,7 @@ class ExistingAgentBridge:
             relation, expected_references = "right_of", 1
         elif any(phrase in text for phrase in ("left of", "left_of", "左边", "左侧")):
             relation, expected_references = "left_of", 1
-        elif any(phrase in text for phrase in ("on top of", "on_top_of", "stack", "叠放", "正上方")):
+        elif any(phrase in text for phrase in ("on top of", "on_top_of", "above", "over", "stack", "叠放", "正上方")):
             relation, expected_references = "on_top_of", 1
         if relation is None or len(queries) != expected_references + 1:
             return None

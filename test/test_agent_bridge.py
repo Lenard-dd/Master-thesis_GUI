@@ -32,6 +32,59 @@ def test_relative_place_followup_uses_the_localization_query_order():
     }
 
 
+def test_semantic_relative_place_uses_persistent_verified_scene_only():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        semantic_intent_parser=lambda _instruction, _objects: {
+            "kind": "relative_place",
+            "source": "black_cube_1",
+            "relation": "on_top_of",
+            "references": ["white_cube_1"],
+            "confidence": 0.95,
+            "needs_clarification": False,
+        },
+    )
+    bridge.record_localization_result({
+        "scene": {"objects": [
+            {"object_id": "black_cube_1", "label": "black cube", "pose_available": True, "pose": {}},
+            {"object_id": "white_cube_1", "label": "white cube", "pose_available": True, "pose": {}},
+        ]}
+    })
+
+    response = bridge.submit("put the dark one on the light one")
+
+    assert response.tool_events[0].tool_name == "compute_place_pose"
+    assert response.tool_events[0].input_json == {
+        "source_id": "black_cube_1",
+        "relation": "on_top_of",
+        "reference_ids": ["white_cube_1"],
+    }
+
+
+def test_semantic_relative_place_rejects_an_object_not_in_verified_scene():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        semantic_intent_parser=lambda _instruction, _objects: {
+            "kind": "relative_place",
+            "source": "invented_cube",
+            "relation": "right_of",
+            "references": ["white_cube_1"],
+            "confidence": 0.95,
+            "needs_clarification": False,
+        },
+    )
+    bridge.record_localization_result({
+        "scene": {"objects": [
+            {"object_id": "white_cube_1", "label": "white cube", "pose_available": True, "pose": {}},
+        ]}
+    })
+
+    response = bridge.submit("put it beside the white cube")
+
+    assert response.tool_events == []
+    assert "cannot safely match" in response.message
+
+
 def test_capability_question_returns_registered_skill_summary_without_a_task():
     response = ExistingAgentBridge("existing_openai").submit("What can you do?")
     assert response.tool_events == []

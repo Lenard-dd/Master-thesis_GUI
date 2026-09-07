@@ -99,6 +99,11 @@ class GuiController:
         self._apply_config_overrides(config_overrides or {})
         self.session_logger = SessionLogger(log_root or self.gui_config.get("log_directory", "logs"))
         self.agent_name = self.gui_config.get("agent_bridge", {}).get("display_name", "Milo")
+        # Keep one bridge for the GUI session so verified localization can be
+        # reused across later natural-language planning requests.
+        self.agent_bridge = ExistingAgentBridge(
+            self.gui_config.get("agent_bridge", {}).get("mode", "mock")
+        )
         self.state.robot_mode = self.gui_config.get("robot_mode", self.gui_config.get("mode", "SIMULATION")).upper()
         rviz_settings = self.gui_config.get("rviz", {})
         self.rviz_manager = RvizProcessManager(
@@ -298,7 +303,7 @@ class GuiController:
         try:
             response = await asyncio.wait_for(
                 asyncio.to_thread(
-                    ExistingAgentBridge(config["mode"]).submit, instruction,
+                    self.agent_bridge.submit, instruction,
                     config.get("execution_mode", "plan_only"),
                     config.get("conversation", {}),
                 ),
@@ -321,6 +326,10 @@ class GuiController:
             # No audit event is emitted for this internal completion flag, but
             # Chat owns the Send button state and must re-enable it promptly.
             self._refresh_event_views()
+
+    def record_agent_localization(self, output: dict[str, Any]) -> None:
+        """Persist only verified localized-object identities for Agent grounding."""
+        self.agent_bridge.record_localization_result(output)
 
     def add_agent_tool_event(self, event) -> None:
         status_map = {

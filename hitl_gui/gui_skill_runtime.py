@@ -178,6 +178,10 @@ class GuiSkillRuntimeAdapter:
         )
         self.controller.state.task_status = TaskStatus.COMPLETED
         self.controller.state.agent_status = SystemComponentStatus.IDLE
+        # Update the persistent Agent catalog only after the runtime reports a
+        # successful SAM3 + RGB-D result.  The bridge retains identities only;
+        # pose values stay inside the local perception/planning pipeline.
+        self.controller.record_agent_localization(output)
         self.controller.add_chat_message(
             _format_localization_report(objects, query_results),
             sent=False,
