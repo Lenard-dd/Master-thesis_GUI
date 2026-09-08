@@ -16,6 +16,7 @@ PHASE_ORDER = {phase: index for index, phase in enumerate(PHASES)}
 TOOL_PHASE = {
     "understand_instruction": "understanding",
     "safe_pick_object": "understanding",
+    "supervised_pick_from_localization": "grasp_generation",
     "describe_scene": "perception",
     "detect_object": "perception",
     "detect_objects": "perception",
@@ -30,6 +31,9 @@ TOOL_PHASE = {
     "move_to_pregrasp": "motion_planning",
     "approach_grasp": "motion_planning",
     "retreat_grasp": "motion_planning",
+    "move_to_place_approach": "motion_planning",
+    "approach_place": "motion_planning",
+    "retreat_place": "motion_planning",
     "plan_motion": "motion_planning",
     "trajectory_review": "hitl_review",
     "open_gripper": "execution",

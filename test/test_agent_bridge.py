@@ -103,6 +103,32 @@ def test_semantic_relative_place_rejects_an_object_not_in_verified_scene():
     assert "cannot safely match" in response.message
 
 
+def test_semantic_pick_and_place_compiles_a_dependency_dag():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        semantic_intent_parser=lambda _instruction, _objects: {
+            "kind": "localize_then_relative_place",
+            "source": "green apple",
+            "relation": "between",
+            "references": ["black cube", "white cube"],
+            "pick_required": True,
+            "confidence": 0.95,
+            "needs_clarification": False,
+        },
+    )
+
+    response = bridge.submit("pick the apple and put it midway between the cubes")
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "detect_objects", "compute_place_pose", "supervised_pick_from_localization",
+    ]
+    assert response.tool_events[1].dependencies == ["agent-move_to_observe-1"]
+    assert response.tool_events[2].dependencies == ["agent-detect_objects-2"]
+    assert response.tool_events[3].dependencies == ["agent-compute_place_pose-3"]
+    assert response.tool_events[3].requires_approval is True
+    assert response.tool_events[3].input_json == {"object_query": "green apple"}
+
+
 def test_capability_question_returns_registered_skill_summary_without_a_task():
     response = ExistingAgentBridge("existing_openai").submit("What can you do?")
     assert response.tool_events == []

@@ -38,13 +38,19 @@ agent_bridge:
 runtime_backends:
   # "mock" is deterministic and intended for short demonstrations.
   # Set perception_mode to "ros" only after D435i/SAM3 ROS health is 2READY;
-  # set grasp_mode to "graspgenx" only after the GUI-managed server is running.
+  # The GUI starts GraspGenX on demand after SAM3 localization releases its
+  # persistent GPU worker. Do not start both models manually on an 8 GB GPU.
   # A requested live backend never falls back to fabricated mock observations.
   perception_mode: "mock"  # mock | ros
   grasp_mode: "mock"       # mock | graspgenx
   mock_perception:
     object_id: "mock_red_cube_1"
     confidence: 0.99
+gpu_handoff:
+  # SAM3 and GraspGenX are GPU-exclusive on the installed 8 GB GPU.
+  # This only bounds the wait after SAM3 has been released and the GUI starts
+  # GraspGenX for grasp-candidate generation.
+  graspgenx_ready_timeout_sec: 45
 phase9:
   # Real-mode planning and RViz preview are available. Physical execution is
   # governed separately by the top-level enable_real_execution safety gate.

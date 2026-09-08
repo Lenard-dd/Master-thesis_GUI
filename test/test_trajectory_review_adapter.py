@@ -37,6 +37,24 @@ class FakeBackend:
         return {"success": True, "message": "real", "plan_id": plan_id}
 
 
+class StationaryNamedTargetBackend(FakeBackend):
+    """MoveIt-style result for a robot already at the requested named pose."""
+
+    def plan_to_named_target(self, target, **kwargs):
+        self.named_target_calls.append(kwargs)
+        self.counter += 1
+        plan_id = f"plan-{self.counter}"
+        joints = [0.1, -1.2, 1.4, -1.7, -1.5, 0.0]
+        return {"plan_id": plan_id, "success": True, "summary": {
+            "plan_id": plan_id, "success": True, "target_name": target,
+            "num_trajectory_points": 1, "duration_sec": 0.0,
+            "trajectory_preview": {
+                "first_point_positions": joints,
+                "last_point_positions": list(joints),
+            },
+        }}
+
+
 async def _wait_for_request(controller):
     for _ in range(100):
         if controller.state.pending_hitl_request:
@@ -70,6 +88,25 @@ def test_named_target_uses_the_configured_simulation_timing_scales():
         "acceleration_scale": 0.10,
         "skill_id": "move_to_named_target",
     }]
+
+
+def test_stationary_named_target_skips_review_and_motion():
+    async def scenario():
+        controller = GuiController()
+        controller.state.robot_mode = "SIMULATION"
+        backend = StationaryNamedTargetBackend()
+        adapter = ExistingTrajectoryReviewAdapter(backend, FakeValidator())
+        adapter.run_in_worker = False
+        controller.set_trajectory_adapter(adapter)
+
+        plan_task = controller.request_named_target_trajectory("observe")
+        await plan_task
+
+        assert controller.state.pending_hitl_request is None
+        assert backend.executed == []
+        assert any(event.event_type == "motion_skipped_already_at_target" for event in controller.state.event_log)
+
+    asyncio.run(scenario())
 
 
 def test_planning_failure_reason_exposes_moveit_and_validator_diagnostics():

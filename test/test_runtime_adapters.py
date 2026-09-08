@@ -63,6 +63,98 @@ def test_live_backend_request_never_falls_back_to_mock_without_ros_node():
     assert "Live" in result["message"]
 
 
+def test_runtime_registry_can_release_the_live_sam3_worker_for_graspgenx():
+    registry = RuntimeAdapterRegistry(
+        RuntimeBackendConfig(perception_mode="ros", grasp_mode="graspgenx")
+    )
+
+    class _LiveAdapter:
+        def __init__(self):
+            self.released = False
+
+        def release_sam3_worker(self):
+            self.released = True
+            return True
+
+    live = _LiveAdapter()
+    registry._live = live
+
+    assert registry.release_sam3_worker() is True
+    assert live.released is True
+
+
+def test_verified_relative_place_returns_to_observe_before_place_approach():
+    controller = GuiController()
+    controller.state.current_task_id = "task-place"
+    parent = ToolNode(
+        node_id="pick-place", parent_id=None, tool_name="supervised_pick_from_localization",
+        display_name="Pick and Place", status=ToolStatus.RUNNING,
+    )
+    controller.state.tool_nodes.append(parent)
+    runtime = controller.skill_runtime
+    runtime._parents["task-place"] = parent.node_id
+    runtime._contexts["task-place"] = {
+        "pending_place_pose_plan": {"relation": "between"},
+    }
+    runtime._prepare_place_motion_context = lambda _task_id: None
+    calls = []
+    runtime._request_named_motion = lambda *args, **kwargs: calls.append((args, kwargs))
+
+    runtime._continue_to_place_or_named_target("task-place", parent)
+
+    assert calls == [
+        ((parent, "observe", "Return To Observe Before Place"), {"purpose": "place_observe"})
+    ]
+
+
+def test_place_observe_completion_starts_the_place_approach_motion():
+    async def scenario():
+        controller = GuiController()
+        controller.state.current_task_id = "task-place"
+        runtime = controller.skill_runtime
+        node = ToolNode(
+            node_id="return-observe", parent_id=None, tool_name="move_to_named_target",
+            display_name="Return To Observe Before Place", status=ToolStatus.SUCCEEDED,
+            input_data={"purpose": "place_observe"},
+        )
+        controller.state.tool_nodes.append(node)
+        calls = []
+        runtime._request_place_pose_motion = lambda *args: calls.append(args)
+
+        runtime.on_motion_execution_completed(node.node_id)
+
+        assert calls == [
+            ("task-place", "move_to_place_approach", "place_approach_pose", "Move To Place Approach")
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_post_place_observe_completion_is_the_terminal_motion():
+    async def scenario():
+        controller = GuiController()
+        controller.state.current_task_id = "task-place"
+        runtime = controller.skill_runtime
+        parent = ToolNode(
+            node_id="pick-place", parent_id=None, tool_name="safe_pick_object",
+            display_name="Pick and Place", status=ToolStatus.RUNNING,
+        )
+        node = ToolNode(
+            node_id="post-place-observe", parent_id=parent.node_id,
+            tool_name="move_to_named_target", display_name="Return To Observe After Place",
+            status=ToolStatus.SUCCEEDED, input_data={"purpose": "post_place_observe"},
+        )
+        controller.state.tool_nodes.extend([parent, node])
+        runtime._parents["task-place"] = parent.node_id
+
+        runtime.on_motion_execution_completed(node.node_id)
+
+        assert parent.status == ToolStatus.SUCCEEDED
+        assert controller.state.task_status.value == "COMPLETED"
+
+    asyncio.run(scenario())
+
+
 def test_safe_pick_completes_the_full_mock_tree_through_each_hitl_gate():
     async def scenario():
         controller = GuiController()

@@ -383,8 +383,9 @@ class GuiController:
                                     "input_json": node.input_data, "output_json": node.output_data,
                                     "requires_approval": node.requires_approval,
                                     "approval_stages": event.approval_stages})
-        if node.requires_approval and event.approval_stages:
-            self.create_agent_hitl_request(node, event.approval_stages)
+        if node.requires_approval:
+            if event.approval_stages and self._dependencies_succeeded(node):
+                self.create_agent_hitl_request(node, event.approval_stages)
         else:
             self._start_ready_read_only_agent_tool(node)
 
@@ -418,9 +419,16 @@ class GuiController:
         )
 
     def start_ready_agent_tool_dependents(self) -> None:
-        """Release pending read-only successors after a tool succeeds."""
+        """Release only dependency-ready DAG successors."""
         for node in self.state.tool_nodes:
-            self._start_ready_read_only_agent_tool(node)
+            if node.status != ToolStatus.PENDING or not self._dependencies_succeeded(node):
+                continue
+            if node.requires_approval:
+                approval_stages = node.output_data.get("approval_stages", [])
+                if isinstance(approval_stages, list) and approval_stages:
+                    self.create_agent_hitl_request(node, [str(item) for item in approval_stages])
+            else:
+                self._start_ready_read_only_agent_tool(node)
 
     def add_chat_message(self, text: str, *, sent: bool, name: str) -> None:
         self.state.conversation.append(ChatEntry(text=text, sent=sent, name=name))
@@ -774,6 +782,68 @@ class GuiController:
         self._last_trajectory_task = asyncio.create_task(self._plan_named_target_trajectory(target, source_node_id))
         return self._last_trajectory_task
 
+    @staticmethod
+    def _is_stationary_named_target_plan(record: Any) -> bool:
+        """Return whether MoveIt confirmed that a named-target motion is a no-op.
+
+        MoveIt may return one trajectory point at ``time_from_start == 0`` when
+        the robot is already at a named target such as ``observe``.  That is a
+        safe, intentional no-op, unlike a multi-point zero-duration trajectory
+        (which remains a planning/time-parameterisation failure).
+        """
+        summary = getattr(record, "summary", {}) or {}
+        if not bool(summary.get("success")):
+            return False
+        try:
+            duration_sec = float(summary.get("duration_sec"))
+            point_count = int(summary.get("num_trajectory_points"))
+        except (TypeError, ValueError):
+            return False
+        if abs(duration_sec) > 1e-6 or point_count != 1:
+            return False
+
+        # The backend reports ``None`` for a one-point trajectory.  Its preview
+        # still contains both endpoint joint vectors, so require them to match
+        # when available rather than accepting an arbitrary malformed plan.
+        preview = summary.get("trajectory_preview", {}) or {}
+        first = preview.get("first_point_positions")
+        last = preview.get("last_point_positions")
+        if not isinstance(first, list) or not isinstance(last, list) or not first or len(first) != len(last):
+            return False
+        try:
+            return max(abs(float(end) - float(start)) for start, end in zip(first, last)) <= 1e-4
+        except (TypeError, ValueError):
+            return False
+
+    def _complete_stationary_named_target_plan(self, record: Any, target: str, source_node_id: str | None) -> None:
+        """Record a verified no-op and continue dependency-driven agent plans."""
+        summary = dict(record.summary)
+        summary.update({
+            "execution": "SKIPPED_NO_OP",
+            "no_op_reason": "already_at_named_target",
+        })
+        if source_node_id:
+            self.update_tool_status(
+                source_node_id, ToolStatus.SUCCEEDED,
+                output_summary={"planning_result": summary},
+                trajectory_id=record.trajectory_id,
+            )
+        self.state.task_status = TaskStatus.EXECUTING
+        self.append_event(
+            "motion_skipped_already_at_target", node_id=source_node_id,
+            metadata={"target": target, "trajectory_id": record.trajectory_id,
+                      "planning_result": summary},
+        )
+        self.add_chat_message(
+            f"Already at the {target} pose; skipped robot motion and continuing the workflow.",
+            sent=False, name="System",
+        )
+        # This follows exactly the same dependency path as an approved motion,
+        # but without creating a misleading HITL review for a trajectory that
+        # contains no movement.
+        if source_node_id:
+            self.skill_runtime.on_motion_execution_completed(source_node_id)
+
     def request_pose_trajectory(
         self, pose: dict[str, Any], *, skill_id: str, source_node_id: str | None = None,
         velocity_scale: float = 0.03, acceleration_scale: float = 0.03,
@@ -805,6 +875,9 @@ class GuiController:
             self.add_chat_message(f"MoveIt planning failed: {exc}", sent=False, name="System")
             if self.state.current_task_id:
                 self.skill_runtime._request_recovery(self.state.current_task_id, "planning_failed", str(exc), ["Retry", "Replan", "Cancel"])
+            return
+        if self._is_stationary_named_target_plan(record):
+            self._complete_stationary_named_target_plan(record, target, source_node_id)
             return
         self._apply_real_motion_safety(record)
         if not bool(record.summary.get("success")) or record.validation_result.get("decision") != "ALLOW":
@@ -1347,7 +1420,7 @@ class GuiController:
                 self._last_skill_task = asyncio.create_task(
                     self.skill_runtime.run_object_localization(node)
                 )
-            elif node and node.tool_name in {"safe_pick_object", "safe_pick"} and request.request_type == "task_intent":
+            elif node and node.tool_name in {"safe_pick_object", "safe_pick", "supervised_pick_from_localization"} and request.request_type == "task_intent":
                 # This runs only sensor/grasp proposal stages.  It does not
                 # invoke MoveIt or any gripper/robot command.
                 try:
@@ -1361,9 +1434,12 @@ class GuiController:
                         sent=False, name="System",
                     )
                 else:
-                    self._last_skill_task = loop.create_task(
-                        self.skill_runtime.run_safe_pick_observation(node)
+                    runner = (
+                        self.skill_runtime.run_supervised_pick_from_localization(node)
+                        if node.tool_name == "supervised_pick_from_localization"
+                        else self.skill_runtime.run_safe_pick_observation(node)
                     )
+                    self._last_skill_task = loop.create_task(runner)
             elif node and node.tool_name == "review_grasp_candidate" and request.request_type == "grasp_candidate":
                 node.status = ToolStatus.SUCCEEDED
                 self.skill_runtime.continue_after_grasp_review(node)
@@ -1748,7 +1824,9 @@ class GuiController:
                 "reason": self.embedded_rviz_manager.get_error() or "startup failed",
             })
             return
-        for component_id in ("camera", "gripper", "graspgenx"):
+        # GraspGenX is deliberately on-demand.  On an 8 GB GPU it cannot
+        # coexist with the persistent SAM3 localization worker.
+        for component_id in ("camera", "gripper"):
             managed = self.start_component(component_id)
             if managed.status.value != "RUNNING":
                 self.state.simulation_launch_status = f"FAILED: {component_id}"
@@ -1806,7 +1884,9 @@ class GuiController:
                 "reason": self.embedded_rviz_manager.get_error() or "startup failed",
             })
             return
-        for component_id in ("camera", "gripper", "graspgenx"):
+        # See the simulation path: start GraspGenX only after a completed
+        # localization releases the SAM3 worker.
+        for component_id in ("camera", "gripper"):
             managed = self.start_component(component_id)
             if managed.status.value != "RUNNING":
                 self.state.simulation_launch_status = f"FAILED: {component_id}"

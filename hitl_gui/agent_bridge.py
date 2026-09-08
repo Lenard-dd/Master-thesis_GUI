@@ -250,11 +250,12 @@ class ExistingAgentBridge:
         if self.mode != "existing_openai" and self._semantic_intent_parser is None:
             return None
         objects = self.trusted_scene_objects()
+        candidates = self.scene_candidate_queries()
         try:
             intent = (
                 self._semantic_intent_parser(instruction, objects)
                 if self._semantic_intent_parser is not None
-                else self._request_semantic_intent(instruction, objects)
+                else self._request_semantic_intent(instruction, objects, candidates)
             )
         except Exception:
             # Preserve the previous AgentController path as a compatibility
@@ -288,41 +289,134 @@ class ExistingAgentBridge:
                 "A between placement needs two reference objects; other relative placements need one reference object."
             )
 
+        pick_required = bool(intent.get("pick_required", False))
         if kind == "relative_place":
             source_id = self._resolve_trusted_object_id(source, objects)
             reference_ids = [self._resolve_trusted_object_id(item, objects) for item in references]
             if source_id is None or any(item is None for item in reference_ids):
+                # A scene scan is semantically useful but not geometrically
+                # verified. If every reference names one of its candidates,
+                # recover by planning the mandatory localization stage.
+                queries = self._candidate_queries_for([source, *references], candidates)
+                if queries is not None:
+                    return (
+                        self._observe_localize_then_place_response(queries, relation)
+                        if pick_required
+                        else self._localize_then_place_response(queries, relation, False)
+                    )
                 return AgentResponse(
                     "I cannot safely match that description to one localized object. "
                     "Please name it more specifically or localize the scene again."
                 )
-            return AgentResponse(
-                "Using the current verified scene, I will compute a plan-only relative placement pose.",
-                [self._compute_place_event(source_id, relation, [str(item) for item in reference_ids])],
-            )
+            if pick_required:
+                # A previous localization may have been captured from an
+                # arbitrary arm/camera pose. Pick/place always refreshes it
+                # after the approved move-to-observe stage.
+                return self._observe_localize_then_place_response(
+                    [self._trusted_label(source_id, objects) or source,
+                     *[self._trusted_label(str(item), objects) or reference for item, reference in zip(reference_ids, references)]],
+                    relation,
+                )
+            else:
+                events = [self._compute_place_event(source_id, relation, [str(item) for item in reference_ids])]
+                message = "Using the current verified scene, I will compute a plan-only relative placement pose."
+            return AgentResponse(message, events)
 
         # The LLM supplies descriptions only. The dependent computation starts
-        # only after this new SAM3 + RGB-D localization succeeds.
+        # only after this new SAM3 + RGB-D localization succeeds.  A requested
+        # pick must use the same fresh localization for its grasp stages: the
+        # legacy safe_pick_object composite performs its own detect_object
+        # call, which would duplicate SAM3 inference and discard the
+        # multi-object scene needed for relative placement.
         queries = [source.strip(), *references]
-        detect_id = "agent-detect_objects-1"
+        return (
+            self._observe_localize_then_place_response(queries, relation)
+            if pick_required else self._localize_then_place_response(queries, relation, False)
+        )
+
+    def _observe_localize_then_place_response(self, queries: list[str], relation: str) -> AgentResponse:
+        observe_id = "agent-move_to_observe-1"
+        detect_id = "agent-detect_objects-2"
+        compute_id = "agent-compute_place_pose-3"
         return AgentResponse(
-            "I will first localize the requested objects from one RGB-D frame, then compute the plan-only relative placement pose.",
+            "I planned a supervised pick-and-place workflow: move to the observation pose, localize the objects, compute the target pose, then request approval for the pick/place sequence.",
             [
                 AgentToolEvent(
-                    node_id=detect_id, parent_id=None, tool_name="detect_objects",
-                    display_name="Localize Objects", status="pending", input_json={"queries": queries},
-                    requires_approval=False, description="Localize requested objects with SAM3 and RGB-D.",
-                    node_type="tool", phase="perception", sequence_index=1,
+                    node_id=observe_id, parent_id=None, tool_name="move_to_named_target",
+                    display_name="Move To Observe", status="waiting_approval",
+                    input_json={"target_name": "observe", "purpose": "agent_observe"},
+                    output_json={"approval_stages": ["task_intent"]},
+                    requires_approval=True, approval_stages=["task_intent"],
+                    description="Move to the approved observation pose before fresh RGB-D localization.",
+                    node_type="tool", phase="motion_planning", sequence_index=1,
                 ),
                 AgentToolEvent(
-                    node_id="agent-compute_place_pose-2", parent_id=detect_id,
-                    tool_name="compute_place_pose", display_name="Compute Place Pose", status="pending",
-                    input_json={"source_id": queries[0], "relation": relation, "reference_ids": queries[1:]},
-                    description="Compute a plan-only relative placement pose from verified localization.",
-                    node_type="tool", phase="motion_planning", sequence_index=2, dependencies=[detect_id],
+                    node_id=detect_id, parent_id=observe_id, tool_name="detect_objects",
+                    display_name="Localize Objects", status="pending", input_json={"queries": queries},
+                    requires_approval=False, description="Localize requested objects after reaching observe.",
+                    node_type="tool", phase="perception", sequence_index=2, dependencies=[observe_id],
                 ),
+                AgentToolEvent(
+                    node_id=compute_id, parent_id=detect_id, tool_name="compute_place_pose",
+                    display_name="Compute Place Pose", status="pending",
+                    input_json={"source_id": queries[0], "relation": relation, "reference_ids": queries[1:]},
+                    requires_approval=False, description="Compute the relative placement pose from this fresh localization.",
+                    node_type="tool", phase="motion_planning", sequence_index=3, dependencies=[detect_id],
+                ),
+                self._supervised_pick_from_localization_event(compute_id, queries[0]),
             ],
         )
+
+    def _localize_then_place_response(
+        self, queries: list[str], relation: str, _pick_required: bool = False,
+    ) -> AgentResponse:
+        detect_id = "agent-detect_objects-1"
+        compute_id = "agent-compute_place_pose-2"
+        events = [
+            AgentToolEvent(
+                node_id=detect_id, parent_id=None, tool_name="detect_objects",
+                display_name="Localize Objects", status="pending", input_json={"queries": queries},
+                requires_approval=False, description="Localize requested objects with SAM3 and RGB-D.",
+                node_type="tool", phase="perception", sequence_index=1,
+            ),
+            AgentToolEvent(
+                node_id=compute_id, parent_id=detect_id,
+                tool_name="compute_place_pose", display_name="Compute Place Pose", status="pending",
+                input_json={"source_id": queries[0], "relation": relation, "reference_ids": queries[1:]},
+                description="Compute a plan-only relative placement pose from verified localization.",
+                node_type="tool", phase="motion_planning", sequence_index=2, dependencies=[detect_id],
+            ),
+        ]
+        return AgentResponse(
+            "I will first localize the requested objects from one RGB-D frame, then compute the plan-only relative placement pose.",
+            events,
+        )
+
+    @staticmethod
+    def _supervised_pick_from_localization_event(dependency_id: str, object_query: str) -> AgentToolEvent:
+        return AgentToolEvent(
+            node_id="agent-supervised_pick_from_localization-4", parent_id=dependency_id,
+            tool_name="supervised_pick_from_localization", display_name="Supervised Pick and Place",
+            status="pending", input_json={"object_query": object_query},
+            output_json={"approval_stages": ["task_intent"]},
+            requires_approval=True, approval_stages=["task_intent"],
+            description="Reuse the fresh trusted localization; generate a grasp without another SAM3 query.",
+            node_type="composite", phase="grasp_generation", sequence_index=4, dependencies=[dependency_id],
+        )
+
+    @staticmethod
+    def _trusted_label(object_id: str, objects: list[dict[str, Any]]) -> str | None:
+        for item in objects:
+            if item.get("object_id") == object_id:
+                label = item.get("label")
+                return str(label) if isinstance(label, str) else None
+        return None
+
+    @staticmethod
+    def _candidate_queries_for(values: list[str], candidates: list[str]) -> list[str] | None:
+        by_key = {candidate.casefold(): candidate for candidate in candidates}
+        resolved = [by_key.get(value.casefold()) for value in values]
+        return [str(item) for item in resolved] if all(resolved) else None
 
     @staticmethod
     def _compute_place_event(source_id: str, relation: str, reference_ids: list[str]) -> AgentToolEvent:
@@ -344,7 +438,7 @@ class ExistingAgentBridge:
         return matches[0] if len(matches) == 1 else None
 
     def _request_semantic_intent(
-        self, instruction: str, objects: list[dict[str, Any]],
+        self, instruction: str, objects: list[dict[str, Any]], candidates: list[str],
     ) -> dict[str, Any] | None:
         from llm_skill_robot.agent.llm_client import OpenAILLMClient
 
@@ -353,14 +447,17 @@ class ExistingAgentBridge:
             "Return exactly one JSON object and no Markdown. Schema: "
             '{"kind":"relative_place|localize_then_relative_place|unknown","source":"string",'
             '"relation":"between|right_of|left_of|on_top_of","references":["string"],'
-            '"confidence":0.0,"needs_clarification":false}. '
+            '"pick_required":false,"confidence":0.0,"needs_clarification":false}. '
             "Interpret natural language flexibly: stack/atop/above means on_top_of; "
             "to the right/left means right_of/left_of; midway/in the middle means between. "
+            "Set pick_required=true only when the user asks to pick/grasp/lift the source object. "
             "For relative_place, source and references MUST be exact object_id values from the trusted catalog, "
             "and every object must be present. For localize_then_relative_place use concise object descriptions "
-            "as queries. between requires two references; other relations require one. "
+            "as queries; when an unverified scene candidate matches, copy that candidate query exactly. "
+            "between requires two references; other relations require one. "
             "Do not infer coordinates, trajectories, grasps, or robot actions. "
-            f"Trusted catalog (no coordinates or images): {json.dumps(objects, ensure_ascii=False)}"
+            f"Trusted catalog (no coordinates or images): {json.dumps(objects, ensure_ascii=False)}. "
+            f"Unverified scene candidates: {json.dumps(candidates, ensure_ascii=False)}"
         )
         raw = OpenAILLMClient().generate_text([
             {"role": "system", "content": prompt},

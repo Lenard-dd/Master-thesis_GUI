@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import socket
 from typing import Any
 
 from hitl_gui.app_state import SystemComponentStatus, TaskStatus, ToolNode, ToolStatus
@@ -58,6 +59,40 @@ class GuiSkillRuntimeAdapter:
             metadata={"tool_name": parent.tool_name, "backend": self.adapters.mode_summary},
         )
         self._request_named_motion(parent, "observe", "Move To Observe")
+
+    async def run_supervised_pick_from_localization(self, parent: ToolNode) -> None:
+        """Start the grasp stages from the DAG's fresh trusted localization.
+
+        This intentionally does not move to observe or call SAM3 again.  Both
+        operations are explicit predecessor nodes in the Agent DAG.
+        """
+        task_id = self.controller.state.current_task_id
+        if not task_id:
+            return
+        query = _query_from_parent(parent, self.controller.state.current_task_name)
+        place_plan = self.controller.pending_place_pose_for_query(str(query))
+        source_id = place_plan.get("source_object_id") if isinstance(place_plan, dict) else None
+        if not isinstance(source_id, str) or not source_id:
+            self.controller.fail_task(
+                "Supervised pick requires the preceding verified place-pose result.",
+                node_id=parent.node_id,
+            )
+            return
+        self._cancelled_task_ids.discard(task_id)
+        self._parents[task_id] = parent.node_id
+        self._last_node_ids[task_id] = parent.node_id
+        self._contexts[task_id] = {
+            "task_id": task_id,
+            "query": query,
+            "pending_place_pose_plan": place_plan,
+            "candidate_objects": [{"object_id": source_id}],
+            "resolved_object_id": source_id,
+            "selected_object": {"object_id": source_id},
+        }
+        self.controller.state.current_target_id = source_id
+        parent.status = ToolStatus.RUNNING
+        self.controller.register_tool_node(parent, append_legacy=False)
+        await self._continue_after_target(task_id, source_id)
 
     async def run_scene_description(
         self,
@@ -150,6 +185,7 @@ class GuiSkillRuntimeAdapter:
             dict(node.input_data),
         )
         try:
+            await self._prepare_sam3_gpu()
             result = await asyncio.to_thread(self.adapters.execute, step, context)
         except Exception as exc:
             result = {
@@ -192,6 +228,7 @@ class GuiSkillRuntimeAdapter:
             sent=False,
             name="System",
         )
+        await self._release_sam3_after_localization()
         # A relative-place computation submitted with this localization task is
         # a dependent, plan-only node.  Start it only after the RGB-D scene is
         # now available to the shared perception pipeline.
@@ -241,6 +278,9 @@ class GuiSkillRuntimeAdapter:
         self.controller.add_chat_message(
             _format_place_pose_report(output), sent=False, name="System",
         )
+        # A pick-and-place DAG may be waiting on this plan-only computation.
+        # It remains pending until this trusted result is available.
+        self.controller.start_ready_agent_tool_dependents()
 
     def on_motion_execution_completed(
         self, motion_node_id: str, review_node_id: str | None = None,
@@ -262,8 +302,30 @@ class GuiSkillRuntimeAdapter:
         if node.tool_name == "move_to_named_target":
             if node.input_data.get("purpose") == "place":
                 self._request_gripper_gate(task_id, "open_gripper", "Release Object", purpose="release")
+            elif node.input_data.get("purpose") == "place_observe":
+                # A held object is first returned to the known, clear observe
+                # posture.  The following place approach is then planned from
+                # this stable state and receives its own trajectory review.
+                self._request_place_pose_motion(
+                    task_id, "move_to_place_approach", "place_approach_pose",
+                    "Move To Place Approach",
+                )
+            elif node.input_data.get("purpose") == "agent_observe":
+                self.controller.start_ready_agent_tool_dependents()
+            elif node.input_data.get("purpose") == "post_place_observe":
+                parent = self._parent(task_id)
+                if parent:
+                    parent.status = ToolStatus.SUCCEEDED
+                    self.controller.register_tool_node(parent, append_legacy=False)
+                self.controller.complete_task()
             else:
                 loop.create_task(self._run_sensor_stages(task_id))
+        elif node.tool_name == "move_to_place_approach":
+            self._request_place_pose_motion(task_id, "approach_place", "place_contact_pose", "Approach Place")
+        elif node.tool_name == "approach_place":
+            self._request_gripper_gate(task_id, "open_gripper", "Release Object", purpose="release")
+        elif node.tool_name == "retreat_place":
+            self._request_post_place_observe(task_id)
         elif node.tool_name == "move_to_pregrasp":
             self._request_pose_motion(task_id, "approach_grasp", "grasp", "Approach Grasp")
         elif node.tool_name == "approach_grasp":
@@ -278,6 +340,7 @@ class GuiSkillRuntimeAdapter:
         self.controller.state.task_status = TaskStatus.PERCEIVING
         query = self._contexts[task_id].get("query") or _query_from_parent(parent, self.controller.state.current_task_name)
         context = self._contexts[task_id]
+        await self._prepare_sam3_gpu()
         result = await self._run_non_motion(
             task_id, parent, "detect_object", "Detect Object",
             {"query": query, "require_pose": True}, context,
@@ -291,6 +354,7 @@ class GuiSkillRuntimeAdapter:
             self._request_recovery(task_id, "no_target_found", "No target found", ["Retry", "Cancel"])
             return
         context["candidate_objects"] = objects
+        await self._release_sam3_after_localization()
         if self._target_review_required(objects):
             self._request_target_review(task_id, parent, context)
             return
@@ -313,6 +377,12 @@ class GuiSkillRuntimeAdapter:
         )
         if not cloud:
             self._request_recovery(task_id, "perception_failed", "Object point cloud could not be built", ["Retry", "Select Another Target", "Cancel"])
+            return
+        try:
+            await self._prepare_graspgenx_gpu()
+        except Exception as exc:
+            self._mark_latest_failed("generate_grasp_pose", str(exc))
+            self._request_recovery(task_id, "grasp_generation_failed", str(exc), ["Retry", "Cancel"])
             return
         generated = await self._run_non_motion(
             task_id, parent, "generate_grasp_pose", "Generate Grasp Candidates",
@@ -339,6 +409,74 @@ class GuiSkillRuntimeAdapter:
         context["selected_grasp_candidate"] = valid[0]
         self.controller.state.current_grasp_candidate_id = _candidate_id(valid[0])
         self._request_grasp_review(task_id, parent, context)
+
+    async def _prepare_sam3_gpu(self) -> None:
+        """Stop GUI-owned GraspGenX before loading/running persistent SAM3."""
+        if not self.adapters.config.uses_live_ros:
+            return
+        managed = await asyncio.to_thread(self.controller.stop_component, "graspgenx")
+        if managed and managed.started_by_gui:
+            self.controller.append_event(
+                "gpu_handoff_to_sam3",
+                metadata={"stopped_component": "graspgenx"},
+            )
+
+    async def _release_sam3_after_localization(self) -> None:
+        """Free SAM3 only when the configured workflow will next use GraspGenX."""
+        if not (self.adapters.config.uses_live_ros and self.adapters.config.uses_live_graspgenx):
+            return
+        released = await asyncio.to_thread(self.adapters.release_sam3_worker)
+        if released:
+            self.controller.append_event(
+                "gpu_handoff_sam3_released",
+                metadata={"next_gpu_consumer": "graspgenx"},
+            )
+
+    async def _prepare_graspgenx_gpu(self) -> None:
+        """Start the GUI-managed GraspGenX server after SAM3 memory is freed."""
+        if not self.adapters.config.uses_live_graspgenx:
+            return
+        # This is idempotent; it returns the existing GUI-owned server if it
+        # is already running, and otherwise starts it only for grasp generation.
+        managed = await asyncio.to_thread(self.controller.start_component, "graspgenx")
+        if managed.status.value != "RUNNING":
+            detail = "; ".join(managed.recent_output[-3:]) or "process did not start"
+            raise RuntimeError(f"Could not start GraspGenX for GPU handoff: {detail}")
+        document = load_grasping_config()
+        grasping = document.get("grasping", document)
+        server = grasping.get("graspgenx_subprocess", {}) or {}
+        host = str(server.get("server_host", "localhost"))
+        port = int(server.get("server_port", 5556))
+        timeout = float(
+            self.controller.gui_config.get("gpu_handoff", {}).get(
+                "graspgenx_ready_timeout_sec", 45.0
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + max(1.0, timeout)
+        while asyncio.get_running_loop().time() < deadline:
+            if managed.process and managed.process.poll() is not None:
+                detail = "; ".join(managed.recent_output[-5:]) or "process exited during startup"
+                raise RuntimeError(f"GraspGenX exited during GPU handoff: {detail}")
+            ready = await asyncio.to_thread(self._tcp_port_open, host, port)
+            if ready:
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise RuntimeError(
+                f"GraspGenX did not become reachable on {host}:{port} within {timeout:.0f} seconds."
+            )
+        self.controller.append_event(
+            "gpu_handoff_to_graspgenx",
+            metadata={"component": "graspgenx", "pid": managed.pid},
+        )
+
+    @staticmethod
+    def _tcp_port_open(host: str, port: int) -> bool:
+        try:
+            with socket.create_connection((host, port), timeout=0.25):
+                return True
+        except OSError:
+            return False
 
     async def _screen_grasps(self, candidates: list[dict[str, Any]], context: dict[str, Any]) -> list[dict[str, Any]]:
         """Reuse the terminal's MoveIt plan-only candidate screening in live mode."""
@@ -518,7 +656,8 @@ class GuiSkillRuntimeAdapter:
         if parent is None:
             return
         motions = [node for node in self.controller.state.tool_nodes if node.parent_id == parent.node_id and
-                   node.tool_name in {"move_to_named_target", "move_to_pregrasp", "approach_grasp", "retreat_grasp"}]
+                   node.tool_name in {"move_to_named_target", "move_to_pregrasp", "approach_grasp", "retreat_grasp",
+                                      "move_to_place_approach", "approach_place", "retreat_place"}]
         if not motions:
             self._request_recovery(task_id, "planning_failed", "No motion request is available to retry", ["Cancel"])
             return
@@ -526,6 +665,13 @@ class GuiSkillRuntimeAdapter:
         if latest.tool_name == "move_to_named_target":
             self._request_named_motion(parent, str(latest.input_data.get("target_name", "home")),
                                        latest.display_name, purpose=str(latest.input_data.get("purpose", "observe")))
+        elif latest.tool_name in {"move_to_place_approach", "approach_place", "retreat_place"}:
+            pose_key = {
+                "move_to_place_approach": "place_approach_pose",
+                "approach_place": "place_contact_pose",
+                "retreat_place": "place_retreat_pose",
+            }[latest.tool_name]
+            self._request_place_pose_motion(task_id, latest.tool_name, pose_key, latest.display_name)
         else:
             pose_key = {"move_to_pregrasp": "pregrasp", "approach_grasp": "grasp", "retreat_grasp": "retreat"}[latest.tool_name]
             self._request_pose_motion(task_id, latest.tool_name, pose_key, latest.display_name)
@@ -603,11 +749,10 @@ class GuiSkillRuntimeAdapter:
         if node.tool_name == "close_gripper":
             self._contexts.get(task_id, {})["last_gripper_result"] = result
         if node.tool_name == "open_gripper" and node.input_data.get("purpose") == "release":
-            parent = self._parent(task_id)
-            if parent:
-                parent.status = ToolStatus.SUCCEEDED
-                self.controller.register_tool_node(parent, append_legacy=False)
-            self.controller.complete_task()
+            if isinstance(self._contexts.get(task_id, {}).get("place_motion_poses"), dict):
+                self._request_place_pose_motion(task_id, "retreat_place", "place_retreat_pose", "Retreat From Place")
+            else:
+                self._request_post_place_observe(task_id)
         elif node.tool_name == "open_gripper":
             self._request_pose_motion(task_id, "move_to_pregrasp", "pregrasp", "Move To Pregrasp")
         else:
@@ -661,14 +806,7 @@ class GuiSkillRuntimeAdapter:
                     ["Retry", "Select Another Grasp", "Cancel"],
                 )
                 return
-            target = str(
-                self.controller.gui_config.get("phase9", {}).get(
-                    "place_named_target", "home"
-                )
-            )
-            self._request_named_motion(
-                parent, target, "Move To Place", purpose="place"
-            )
+            self._continue_to_place_or_named_target(task_id, parent)
             return
         from llm_skill_robot.grasping.grasp_verifier import GraspVerifier
         verification_success = bool(self.controller.gui_config.get("phase9", {}).get("mock_verification_success", True))
@@ -691,8 +829,38 @@ class GuiSkillRuntimeAdapter:
         if not verification_success:
             self._request_recovery(task_id, "grasp_verification_failed", "Grasp verification failed", ["Retry", "Select Another Grasp", "Cancel"])
             return
+        self._continue_to_place_or_named_target(task_id, parent)
+
+    def _continue_to_place_or_named_target(self, task_id: str, parent: ToolNode) -> None:
+        context = self._contexts.get(task_id, {})
+        if isinstance(context.get("pending_place_pose_plan"), dict):
+            try:
+                self._prepare_place_motion_context(task_id)
+            except Exception as exc:
+                self._request_recovery(task_id, "place_motion_preparation_failed", f"Could not prepare the verified place motion: {exc}", ["Cancel"])
+                return
+            # Use the calibrated observation posture as a conservative transit
+            # waypoint while holding an object.  It produces a separate
+            # preview/review and avoids planning a long direct grasp-to-place
+            # path from an arbitrary final grasp configuration.
+            self._request_named_motion(
+                parent, "observe", "Return To Observe Before Place",
+                purpose="place_observe",
+            )
+            return
         target = str(self.controller.gui_config.get("phase9", {}).get("place_named_target", "home"))
         self._request_named_motion(parent, target, "Move To Place", purpose="place")
+
+    def _request_post_place_observe(self, task_id: str) -> None:
+        """Finish a physical pick/place only after returning to observe."""
+        parent = self._parent(task_id)
+        if parent is None:
+            self.controller.complete_task()
+            return
+        self._request_named_motion(
+            parent, "observe", "Return To Observe After Place",
+            purpose="post_place_observe",
+        )
 
     async def _run_non_motion(self, task_id, parent, skill_id, display_name, parameters, context):
         if task_id in self._cancelled_task_ids:
@@ -790,6 +958,59 @@ class GuiSkillRuntimeAdapter:
             pose, skill_id=skill_id, source_node_id=node.node_id,
             velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
             planning_kwargs=planning_kwargs,
+        )
+
+    def _request_place_pose_motion(self, task_id, skill_id, pose_key, display_name) -> None:
+        parent = self._parent(task_id)
+        context = self._contexts.get(task_id, {})
+        poses = context.get("place_motion_poses")
+        pose = poses.get(pose_key) if isinstance(poses, dict) else None
+        if parent is None or not isinstance(pose, dict):
+            self.controller.fail_task(
+                f"{display_name} requires verified place-motion poses.",
+                node_id=parent.node_id if parent else None,
+            )
+            return
+        node = self._add_node(parent, skill_id, display_name, {
+            "object_id": context.get("resolved_object_id"),
+            "place_relation": context.get("pending_place_pose_plan", {}).get("relation"),
+        })
+        self.controller.update_tool_status(node.node_id, ToolStatus.RUNNING)
+        policy = context.get("grasp_motion_policy")
+        policy_skill = {
+            "move_to_place_approach": "move_to_pregrasp",
+            "approach_place": "approach_grasp",
+            "retreat_place": "retreat_grasp",
+        }[skill_id]
+        planning_kwargs = policy.kwargs_for(policy_skill) if policy is not None else {}
+        velocity_scale = policy.velocity_scale if policy is not None else 0.03
+        acceleration_scale = policy.acceleration_scale if policy is not None else 0.03
+        self.controller.request_pose_trajectory(
+            pose, skill_id=skill_id, source_node_id=node.node_id,
+            velocity_scale=velocity_scale, acceleration_scale=acceleration_scale,
+            planning_kwargs=planning_kwargs,
+        )
+
+    def _prepare_place_motion_context(self, task_id: str) -> None:
+        """Convert a verified object-centre plan into end-effector place poses."""
+        from llm_skill_robot.perception.place_motion_builder import PlaceMotionBuilder
+
+        context = self._contexts[task_id]
+        plan = context.get("pending_place_pose_plan")
+        grasp_poses = context.get("grasp_motion_poses")
+        grasp_pose = grasp_poses.get("grasp") if isinstance(grasp_poses, dict) else None
+        if not isinstance(plan, dict) or not isinstance(grasp_pose, dict):
+            raise ValueError("A verified place plan and reviewed grasp pose are required.")
+        document = load_grasping_config()
+        grasping = document.get("grasping", document)
+        config = grasping.get("place_motion", {}) or {}
+        context["place_motion_poses"] = PlaceMotionBuilder(
+            approach_height_m=float(config.get("approach_height_m", 0.05)),
+            max_grasp_offset_m=float(config.get("max_grasp_offset_m", 0.15)),
+        ).build(
+            source_pose=plan.get("source_pose", {}),
+            target_pose=plan.get("target_pose", {}),
+            grasp_pose=grasp_pose,
         )
 
     def _prepare_grasp_motion_context(self, task_id: str) -> None:

@@ -116,6 +116,22 @@ class ExistingRosSensorGraspAdapter:
             place_pose_visualizer=self._place_pose_visualizer,
         )
 
+    def release_sam3_worker(self) -> bool:
+        """Release the optional persistent SAM3 worker and its GPU memory.
+
+        The scene model and generated mask paths remain in the perception
+        pipeline.  Releasing the worker therefore does not invalidate a
+        completed RGB-D localization, but makes room for GraspGenX on 8 GB
+        GPUs.
+        """
+        backend = getattr(self._perception_pipeline, "backend", None)
+        detector = getattr(backend, "detector_adapter", None)
+        close = getattr(detector, "close", None)
+        if not callable(close):
+            return False
+        close()
+        return True
+
 
 class RuntimeAdapterRegistry:
     """Choose adapters explicitly; never silently replace a live request with mock data."""
@@ -150,6 +166,16 @@ class RuntimeAdapterRegistry:
             return self._live.execute(step, context)
         except Exception as exc:
             return _failure(step, f"Live {step.skill_id} backend is unavailable: {exc}")
+
+    def release_sam3_worker(self) -> bool:
+        """Best-effort GPU handoff from live SAM3 to GraspGenX.
+
+        This is deliberately a no-op for mock perception and before the live
+        adapter has ever been created.
+        """
+        if self._live is None:
+            return False
+        return self._live.release_sam3_worker()
 
 
 def _failure(step, message: str) -> dict[str, Any]:
