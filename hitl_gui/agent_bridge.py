@@ -53,6 +53,7 @@ class ExistingAgentBridge:
         self,
         mode: str = "existing_scripted",
         semantic_intent_parser: Callable[[str, list[dict[str, Any]]], dict[str, Any] | None] | None = None,
+        structured_task_parser: Callable[[str, list[dict[str, Any]], list[str]], dict[str, Any] | None] | None = None,
     ) -> None:
         self.mode = mode
         # Populated only from successful RGB-D localization output. This is
@@ -62,6 +63,9 @@ class ExistingAgentBridge:
         self._scene_candidate_queries: list[str] = []
         self._scene_lock = threading.RLock()
         self._semantic_intent_parser = semantic_intent_parser
+        # Optional injection point used by tests and by deployments that host
+        # their own structured-planning LLM endpoint.
+        self._structured_task_parser = structured_task_parser
 
     def record_localization_result(self, output: dict[str, Any]) -> None:
         """Replace memory with the latest verified, pose-bearing scene objects."""
@@ -139,6 +143,13 @@ class ExistingAgentBridge:
             return AgentResponse(conversation)
         if self.is_small_talk(instruction):
             return AgentResponse(self._llm_conversation_reply(instruction, conversation_config or {}))
+        structured_response = self._structured_multi_subgoal_response(instruction)
+        if structured_response is not None:
+            return structured_response
+        # Keep the lightweight "localize all candidates" shortcut for a
+        # standalone request, but do it *after* multi-subgoal planning.  A
+        # sentence such as "first localize all candidates, then ..." must not
+        # be truncated to only its first perception clause.
         candidate_response = self._scene_candidate_localization_response(instruction)
         if candidate_response is not None:
             return candidate_response
@@ -212,6 +223,233 @@ class ExistingAgentBridge:
                 node_type="composite",
             )])
         return AgentResponse(decision.message)
+
+    def _structured_multi_subgoal_response(self, instruction: str) -> AgentResponse | None:
+        """Compile a bounded LLM task decomposition into an executable skill DAG.
+
+        The LLM chooses only symbolic subgoals.  This bridge validates their
+        relation/object arguments and expands each manipulation subgoal into
+        the fixed, reviewed observation/localization/place/pick workflow.
+        It never accepts LLM-provided poses, trajectories, ROS commands, or
+        direct gripper actions.
+        """
+        if not self._looks_like_multi_subgoal_task(instruction):
+            return None
+        if self.mode != "existing_openai" and self._structured_task_parser is None:
+            return None
+        objects = self.trusted_scene_objects()
+        candidates = self.scene_candidate_queries()
+        try:
+            plan = (
+                self._structured_task_parser(instruction, objects, candidates)
+                if self._structured_task_parser is not None
+                else self._request_structured_task_plan(instruction, objects, candidates)
+            )
+        except Exception:
+            return None
+        if not isinstance(plan, dict) or str(plan.get("kind", "")) != "task_plan":
+            return None
+        # A planner may optionally expose calibrated confidence.  Low
+        # confidence is never silently converted into robot work; ask for
+        # clarification instead.  Plans without the field remain compatible
+        # with simple local OpenAI-compatible endpoints.
+        confidence = plan.get("confidence")
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) and confidence < 0.65:
+            return AgentResponse(
+                "I am not confident enough to bind that request to a reviewed robot plan. "
+                "Please clarify the object names or the intended relative positions."
+            )
+        if bool(plan.get("needs_clarification", False)):
+            return AgentResponse(
+                "I can plan this as ordered robot subgoals, but the objects or relations are ambiguous. "
+                "Please name each object and its intended relative position."
+            )
+        raw_subgoals = plan.get("subgoals")
+        if not isinstance(raw_subgoals, list) or not 1 <= len(raw_subgoals) <= 4:
+            return AgentResponse(
+                "I need between one and four clear subgoals for a reviewed robot plan."
+            )
+
+        events: list[AgentToolEvent] = []
+        predecessor: str | None = None
+        sequence = 1
+        for index, raw in enumerate(raw_subgoals, start=1):
+            if not isinstance(raw, dict):
+                return AgentResponse("One of the proposed subgoals is not structured correctly.")
+            action = str(raw.get("action", "")).strip().casefold()
+            if action == "describe_scene":
+                node_id = f"agent-{index}-describe_scene"
+                events.append(AgentToolEvent(
+                    node_id=node_id, parent_id=predecessor, tool_name="describe_scene",
+                    display_name=f"Describe Scene ({index})", status="pending",
+                    description="Read-only semantic scene description.", node_type="tool",
+                    phase="perception", sequence_index=sequence,
+                    dependencies=[predecessor] if predecessor else [],
+                ))
+                predecessor, sequence = node_id, sequence + 1
+                continue
+            if action == "localize":
+                queries = self._subgoal_queries(raw.get("queries"), objects, candidates)
+                if not queries:
+                    return AgentResponse("Each localization subgoal needs one or more specific object descriptions.")
+                node_id = f"agent-{index}-detect_objects"
+                events.append(AgentToolEvent(
+                    node_id=node_id, parent_id=predecessor, tool_name="detect_objects",
+                    display_name=f"Localize Objects ({index})", status="pending",
+                    input_json={"queries": queries}, description="Localize requested objects from one RGB-D frame.",
+                    node_type="tool", phase="perception", sequence_index=sequence,
+                    dependencies=[predecessor] if predecessor else [],
+                ))
+                predecessor, sequence = node_id, sequence + 1
+                continue
+            if action not in {"pick_place", "relative_place"}:
+                return AgentResponse(
+                    f"The subgoal action {action!r} is not available in the reviewed skill catalog."
+                )
+            parsed = self._subgoal_relation(raw, objects, candidates)
+            if parsed is None:
+                return AgentResponse(
+                    "Each placement subgoal needs one source object, a supported relation, and the required reference object(s)."
+                )
+            source, relation, references = parsed
+            queries = [source, *references]
+            if action == "pick_place":
+                observe_id = f"agent-{index}-move_to_observe"
+                events.append(AgentToolEvent(
+                    node_id=observe_id, parent_id=predecessor,
+                    tool_name="move_to_named_target", display_name=f"Move To Observe ({index})",
+                    status="waiting_approval", input_json={"target_name": "observe", "purpose": "agent_observe"},
+                    output_json={"approval_stages": ["task_intent"]},
+                    requires_approval=True, approval_stages=["task_intent"],
+                    description="Move to the approved observation pose before fresh localization.",
+                    node_type="tool", phase="motion_planning", sequence_index=sequence,
+                    dependencies=[predecessor] if predecessor else [],
+                ))
+                predecessor = observe_id
+                sequence += 1
+            detect_id = f"agent-{index}-detect_objects"
+            events.append(AgentToolEvent(
+                node_id=detect_id, parent_id=predecessor, tool_name="detect_objects",
+                display_name=f"Localize Subgoal {index}", status="pending", input_json={"queries": queries},
+                description="Fresh shared-frame localization for this placement subgoal.",
+                node_type="tool", phase="perception", sequence_index=sequence,
+                dependencies=[predecessor] if predecessor else [],
+            ))
+            sequence += 1
+            compute_id = f"agent-{index}-compute_place_pose"
+            events.append(AgentToolEvent(
+                node_id=compute_id, parent_id=detect_id, tool_name="compute_place_pose",
+                display_name=f"Compute Place Pose ({index})", status="pending",
+                input_json={"source_id": source, "relation": relation, "reference_ids": references},
+                description="Compute a metric relative placement pose from fresh localization.",
+                node_type="tool", phase="motion_planning", sequence_index=sequence,
+                dependencies=[detect_id],
+            ))
+            sequence += 1
+            if action == "pick_place":
+                pick_id = f"agent-{index}-supervised_pick_from_localization"
+                events.append(AgentToolEvent(
+                    node_id=pick_id, parent_id=compute_id,
+                    tool_name="supervised_pick_from_localization",
+                    display_name=f"Supervised Pick and Place ({index})", status="pending",
+                    input_json={"object_query": source},
+                    output_json={"approval_stages": ["task_intent"]},
+                    requires_approval=True, approval_stages=["task_intent"],
+                    description="Generate and review the grasp, then execute the approved pick/place workflow.",
+                    node_type="composite", phase="grasp_generation", sequence_index=sequence,
+                    dependencies=[compute_id],
+                ))
+                predecessor = pick_id
+                sequence += 1
+            else:
+                predecessor = compute_id
+
+        summary = str(plan.get("summary", "")).strip()
+        message = summary or (
+            f"I compiled {len(raw_subgoals)} ordered subgoal(s). Read-only perception and geometry run automatically; "
+            "each robot motion and gripper action will remain reviewed."
+        )
+        return AgentResponse(message, events)
+
+    @staticmethod
+    def _looks_like_multi_subgoal_task(instruction: str) -> bool:
+        text = " ".join(instruction.casefold().split())
+        markers = (
+            " then ", " after that", " next ", " followed by", " first ",
+            "然后", "再", "接着", "随后", "先",
+        )
+        return any(marker in text for marker in markers)
+
+    def _subgoal_relation(
+        self, raw: dict[str, Any], objects: list[dict[str, Any]], candidates: list[str],
+    ) -> tuple[str, str, list[str]] | None:
+        source = self._ground_subgoal_query(raw.get("source"), objects, candidates)
+        relation = str(raw.get("relation", "")).strip().casefold()
+        references_raw = raw.get("references")
+        if not isinstance(references_raw, list):
+            return None
+        references = [self._ground_subgoal_query(item, objects, candidates) for item in references_raw]
+        if source is None or any(item is None for item in references):
+            return None
+        references = [str(item) for item in references]
+        expected = 2 if relation == "between" else 1
+        if relation not in {"between", "right_of", "left_of", "on_top_of"} or len(references) != expected:
+            return None
+        if source in references or len(set(references)) != len(references):
+            return None
+        return source, relation, references
+
+    def _subgoal_queries(
+        self, raw: Any, objects: list[dict[str, Any]], candidates: list[str],
+    ) -> list[str]:
+        if not isinstance(raw, list) or not 1 <= len(raw) <= 8:
+            return []
+        queries = [self._ground_subgoal_query(item, objects, candidates) for item in raw]
+        if any(item is None for item in queries):
+            return []
+        return list(dict.fromkeys(str(item) for item in queries))
+
+    def _ground_subgoal_query(
+        self, value: Any, objects: list[dict[str, Any]], candidates: list[str],
+    ) -> str | None:
+        if not isinstance(value, str):
+            return None
+        query = " ".join(value.strip().split())
+        if not query or len(query) > 80 or query.casefold() in {"all", "all objects", "everything", "所有物体"}:
+            return None
+        trusted_id = self._resolve_trusted_object_id(query, objects)
+        if trusted_id:
+            return self._trusted_label(trusted_id, objects) or query
+        candidate = next((item for item in candidates if item.casefold() == query.casefold()), None)
+        return candidate or query
+
+    def _request_structured_task_plan(
+        self, instruction: str, objects: list[dict[str, Any]], candidates: list[str],
+    ) -> dict[str, Any] | None:
+        from llm_skill_robot.agent.llm_client import OpenAILLMClient
+
+        prompt = (
+            "You are a constrained robot task planner. Return exactly one JSON object, no Markdown. "
+            "Schema: {\"kind\":\"task_plan|unknown\",\"summary\":\"string\",\"confidence\":0.0,\"needs_clarification\":false,"
+            "\"subgoals\":[{\"action\":\"describe_scene|localize|relative_place|pick_place\","
+            "\"queries\":[\"string\"],\"source\":\"string\","
+            "\"relation\":\"between|right_of|left_of|on_top_of\",\"references\":[\"string\"]}]}. "
+            "Plan at most four ordered subgoals. Use pick_place only for moving one object, and always specify "
+            "one source plus two references for between or one reference for the other relations. "
+            "Use relative_place only for calculating a pose without manipulating. Use localize only for read-only localization. "
+            "Do not output coordinates, trajectories, grasps, ROS commands, gripper commands, or unsupported actions. "
+            "Use exact trusted labels/IDs or candidate queries when possible. If unclear, set needs_clarification=true. "
+            f"Trusted verified objects (no coordinates): {json.dumps(objects, ensure_ascii=False)}. "
+            f"Unverified scene candidates: {json.dumps(candidates, ensure_ascii=False)}."
+        )
+        raw = OpenAILLMClient().generate_text([
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": instruction},
+        ]).strip()
+        if raw.startswith("```"):
+            raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
 
     def _scene_candidate_localization_response(self, instruction: str) -> AgentResponse | None:
         """Expand 'all objects' into queries from the latest scene scan."""

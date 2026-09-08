@@ -129,6 +129,87 @@ def test_semantic_pick_and_place_compiles_a_dependency_dag():
     assert response.tool_events[3].input_json == {"object_query": "green apple"}
 
 
+def test_structured_multi_subgoal_plan_compiles_two_serial_pick_place_workflows():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan",
+            "summary": "I will perform two reviewed placements in order.",
+            "needs_clarification": False,
+            "subgoals": [
+                {
+                    "action": "pick_place", "source": "red cube",
+                    "relation": "right_of", "references": ["black cube"],
+                },
+                {
+                    "action": "pick_place", "source": "white cube",
+                    "relation": "right_of", "references": ["red cube"],
+                },
+            ],
+        },
+    )
+
+    response = bridge.submit(
+        "First put the red cube right of the black cube, then put the white cube right of the red cube."
+    )
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "detect_objects", "compute_place_pose", "supervised_pick_from_localization",
+        "move_to_named_target", "detect_objects", "compute_place_pose", "supervised_pick_from_localization",
+    ]
+    first_pick = response.tool_events[3]
+    second_observe = response.tool_events[4]
+    assert first_pick.input_json == {"object_query": "red cube"}
+    assert second_observe.dependencies == [first_pick.node_id]
+    assert response.tool_events[7].input_json == {"object_query": "white cube"}
+
+
+def test_structured_plan_rejects_an_ungrounded_bulk_object_placeholder():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "needs_clarification": False,
+            "subgoals": [{
+                "action": "pick_place", "source": "all objects",
+                "relation": "right_of", "references": ["black cube"],
+            }],
+        },
+    )
+
+    response = bridge.submit("First arrange all objects, then continue.")
+
+    assert response.tool_events == []
+    assert "source object" in response.message
+
+
+def test_multi_subgoal_planner_precedes_the_standalone_all_candidates_shortcut():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.9, "needs_clarification": False,
+            "subgoals": [
+                {"action": "localize", "queries": ["green apple", "black cube"]},
+                {
+                    "action": "relative_place", "source": "green apple",
+                    "relation": "between", "references": ["black cube", "white cube"],
+                },
+            ],
+        },
+    )
+    bridge.record_scene_description({"candidate_objects": [
+        {"query": "green apple"}, {"query": "black cube"}, {"query": "white cube"},
+    ]})
+
+    response = bridge.submit(
+        "First localize all candidates, then compute a pose for the apple between the two cubes."
+    )
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "detect_objects", "detect_objects", "compute_place_pose",
+    ]
+    assert response.tool_events[1].dependencies == [response.tool_events[0].node_id]
+
+
 def test_capability_question_returns_registered_skill_summary_without_a_task():
     response = ExistingAgentBridge("existing_openai").submit("What can you do?")
     assert response.tool_events == []

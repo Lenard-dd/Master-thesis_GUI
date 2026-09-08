@@ -165,6 +165,9 @@ class GuiSkillRuntimeAdapter:
         if include_rescan_hint:
             report += " To analyze the scene again, ask me to describe or scan the scene."
         self.controller.add_chat_message(report, sent=False, name=reporter_name)
+        # A structured plan may place localization or manipulation after a
+        # scene description.  Release only dependency-ready successors.
+        self.controller.start_ready_agent_tool_dependents()
 
     async def run_object_localization(self, node: ToolNode) -> None:
         """Execute one approved read-only SAM3 + RGB-D localization skill."""
@@ -317,7 +320,13 @@ class GuiSkillRuntimeAdapter:
                 if parent:
                     parent.status = ToolStatus.SUCCEEDED
                     self.controller.register_tool_node(parent, append_legacy=False)
-                self.controller.complete_task()
+                # A structured plan can contain another pick/place subgoal
+                # after this composite parent.  Its dependency becomes ready
+                # only once the whole preceding subgoal has returned to the
+                # observation pose.
+                self.controller.start_ready_agent_tool_dependents()
+                if not self._has_pending_agent_successor(task_id, parent.node_id if parent else None):
+                    self.controller.complete_task()
             else:
                 loop.create_task(self._run_sensor_stages(task_id))
         elif node.tool_name == "move_to_place_approach":
@@ -861,6 +870,17 @@ class GuiSkillRuntimeAdapter:
             parent, "observe", "Return To Observe After Place",
             purpose="post_place_observe",
         )
+
+    def _has_pending_agent_successor(self, task_id: str, completed_parent_id: str | None) -> bool:
+        """Whether a structured DAG has work after a completed composite node."""
+        if not completed_parent_id:
+            return False
+        for node in self.controller.state.tool_nodes:
+            if completed_parent_id not in node.dependencies:
+                continue
+            if node.status in {ToolStatus.PENDING, ToolStatus.WAITING_APPROVAL, ToolStatus.RUNNING}:
+                return True
+        return False
 
     async def _run_non_motion(self, task_id, parent, skill_id, display_name, parameters, context):
         if task_id in self._cancelled_task_ids:

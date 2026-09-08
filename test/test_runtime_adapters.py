@@ -155,6 +155,39 @@ def test_post_place_observe_completion_is_the_terminal_motion():
     asyncio.run(scenario())
 
 
+def test_post_place_observe_releases_a_dependent_next_subgoal_instead_of_completing():
+    async def scenario():
+        controller = GuiController()
+        controller.state.current_task_id = "task-sequence"
+        runtime = controller.skill_runtime
+        parent = ToolNode(
+            node_id="pick-place-1", parent_id=None, tool_name="supervised_pick_from_localization",
+            display_name="Pick and Place 1", status=ToolStatus.RUNNING,
+        )
+        post = ToolNode(
+            node_id="post-place-observe", parent_id=parent.node_id,
+            tool_name="move_to_named_target", display_name="Return To Observe After Place",
+            status=ToolStatus.SUCCEEDED, input_data={"purpose": "post_place_observe"},
+        )
+        next_observe = ToolNode(
+            node_id="pick-place-2-observe", parent_id=None, tool_name="move_to_named_target",
+            display_name="Move To Observe (2)", status=ToolStatus.WAITING_APPROVAL,
+            requires_approval=True, dependencies=[parent.node_id],
+        )
+        controller.state.tool_nodes.extend([parent, post, next_observe])
+        runtime._parents["task-sequence"] = parent.node_id
+        released = []
+        controller.start_ready_agent_tool_dependents = lambda: released.append(True)
+
+        runtime.on_motion_execution_completed(post.node_id)
+
+        assert parent.status == ToolStatus.SUCCEEDED
+        assert released == [True]
+        assert controller.state.task_status.value != "COMPLETED"
+
+    asyncio.run(scenario())
+
+
 def test_safe_pick_completes_the_full_mock_tree_through_each_hitl_gate():
     async def scenario():
         controller = GuiController()
