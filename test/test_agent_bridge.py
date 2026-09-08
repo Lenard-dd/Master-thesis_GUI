@@ -69,7 +69,7 @@ def test_semantic_relative_place_uses_persistent_verified_scene_only():
         ]}
     })
 
-    response = bridge.submit("put the dark one on the light one")
+    response = bridge.submit("compute a plan-only pose to put the dark one on the light one")
 
     assert response.tool_events[0].tool_name == "compute_place_pose"
     assert response.tool_events[0].input_json == {
@@ -127,6 +127,25 @@ def test_semantic_pick_and_place_compiles_a_dependency_dag():
     assert response.tool_events[3].dependencies == ["agent-compute_place_pose-3"]
     assert response.tool_events[3].requires_approval is True
     assert response.tool_events[3].input_json == {"object_query": "green apple"}
+
+
+def test_plain_place_request_is_a_supervised_pick_and_place_not_only_a_pose_computation():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        semantic_intent_parser=lambda _instruction, _objects: {
+            "kind": "localize_then_relative_place",
+            "source": "white cube", "relation": "on_top_of", "references": ["black cube"],
+            # Simulate an older parser response: the bridge must not allow
+            # this false value to downgrade a physical place command.
+            "pick_required": False, "confidence": 0.95, "needs_clarification": False,
+        },
+    )
+
+    response = bridge.submit("place the white cube on top of the black cube")
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "detect_objects", "compute_place_pose", "supervised_pick_from_localization",
+    ]
 
 
 def test_structured_multi_subgoal_plan_compiles_two_serial_pick_place_workflows():
@@ -208,6 +227,110 @@ def test_multi_subgoal_planner_precedes_the_standalone_all_candidates_shortcut()
         "detect_objects", "detect_objects", "compute_place_pose",
     ]
     assert response.tool_events[1].dependencies == [response.tool_events[0].node_id]
+
+
+def test_two_placement_clauses_joined_by_and_use_the_structured_planner():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        semantic_intent_parser=lambda *_args: (_ for _ in ()).throw(
+            AssertionError("single-relation parser must not handle two placements")
+        ),
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            "subgoals": [
+                {
+                    "action": "pick_place", "source": "white cube",
+                    "relation": "on_top_of", "references": ["black cube"],
+                },
+                {
+                    "action": "pick_place", "source": "green apple",
+                    "relation": "on_top_of", "references": ["white cube"],
+                },
+            ],
+        },
+    )
+
+    response = bridge.submit(
+        "place white cube on top of black cube and place apple on top of white cube"
+    )
+
+    assert len(response.tool_events) == 8
+    assert response.tool_events[0].tool_name == "move_to_named_target"
+    assert response.tool_events[0].input_json == {"target_name": "observe", "purpose": "agent_observe"}
+    assert response.tool_events[4].dependencies == [response.tool_events[3].node_id]
+    assert response.tool_events[7].input_json == {"object_query": "green apple"}
+
+
+def test_structured_planner_canonicalizes_short_object_names_to_scene_candidates():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            "subgoals": [{
+                "action": "pick_place", "source": "white cube",
+                "relation": "on_top_of", "references": ["black cube"],
+            }],
+        },
+    )
+    bridge.record_scene_description({"candidate_objects": [
+        {"query": "white block with number 5"},
+        {"query": "black block with number 3"},
+        {"query": "green apple"},
+    ]})
+
+    response = bridge.submit("First place the white cube on the black cube, then stop.")
+
+    assert response.tool_events[1].input_json == {
+        "queries": ["white block with number 5", "black block with number 3"],
+    }
+    assert response.tool_events[2].input_json == {
+        "source_id": "white block with number 5", "relation": "on_top_of",
+        "reference_ids": ["black block with number 3"],
+    }
+
+
+def test_structured_planner_rejects_an_llm_reference_outside_scene_candidates():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            "subgoals": [{
+                "action": "pick_place", "source": "black cube",
+                "relation": "on_top_of", "references": ["table"],
+            }],
+        },
+    )
+    bridge.record_scene_description({"candidate_objects": [
+        {"query": "white cube with number 5"}, {"query": "black cube with number 3"},
+    ]})
+
+    response = bridge.submit("place the black cube on the table and then continue")
+
+    assert response.tool_events == []
+    assert "source object" in response.message
+
+
+def test_structured_planner_accepts_common_model_aliases_without_relaxing_object_grounding():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            "subgoals": [{
+                "action": "place", "source": "white cube",
+                "relation": "above", "reference": "black cube",
+            }],
+        },
+    )
+    bridge.record_scene_description({"candidate_objects": [
+        {"query": "white cube with number 5"}, {"query": "black cube with number 3"},
+    ]})
+
+    response = bridge.submit("First stack the white cube on the black cube, then stop.")
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "detect_objects", "compute_place_pose", "supervised_pick_from_localization",
+    ]
+    assert response.tool_events[2].input_json["relation"] == "on_top_of"
 
 
 def test_capability_question_returns_registered_skill_summary_without_a_task():

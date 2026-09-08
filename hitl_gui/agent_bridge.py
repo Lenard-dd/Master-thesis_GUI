@@ -276,7 +276,7 @@ class ExistingAgentBridge:
         for index, raw in enumerate(raw_subgoals, start=1):
             if not isinstance(raw, dict):
                 return AgentResponse("One of the proposed subgoals is not structured correctly.")
-            action = str(raw.get("action", "")).strip().casefold()
+            action = self._normalise_subgoal_action(raw.get("action"))
             if action == "describe_scene":
                 node_id = f"agent-{index}-describe_scene"
                 events.append(AgentToolEvent(
@@ -308,8 +308,12 @@ class ExistingAgentBridge:
                 )
             parsed = self._subgoal_relation(raw, objects, candidates)
             if parsed is None:
+                known_names = [str(item.get("label")) for item in objects if isinstance(item.get("label"), str)]
+                known_names.extend(candidates)
+                available = ", ".join(dict.fromkeys(known_names)) or "no scene candidates yet"
                 return AgentResponse(
-                    "Each placement subgoal needs one source object, a supported relation, and the required reference object(s)."
+                    "Each placement subgoal needs one source object, a supported relation, and the required reference object(s). "
+                    f"I could not bind subgoal {index} to the current scene objects: {available}."
                 )
             source, relation, references = parsed
             queries = [source, *references]
@@ -378,14 +382,31 @@ class ExistingAgentBridge:
             " then ", " after that", " next ", " followed by", " first ",
             "然后", "再", "接着", "随后", "先",
         )
-        return any(marker in text for marker in markers)
+        if any(marker in text for marker in markers):
+            return True
+        # Natural commands often omit explicit sequencing words, for example:
+        # "place the white cube on the black cube and place the apple on the
+        # white cube".  Two manipulation verbs are a much stronger signal
+        # than the word "and" alone (which may only join two object names),
+        # and should therefore enter the structured planner rather than the
+        # legacy single-relation parser.
+        english_actions = re.findall(
+            r"\b(?:pick(?:\s+up)?|place|put|move|stack|set|position)\b", text,
+        )
+        chinese_actions = re.findall(r"(?:抓取|拿起|放置|放到|放在|移动|堆叠)", text)
+        return len(english_actions) >= 2 or len(chinese_actions) >= 2
 
     def _subgoal_relation(
         self, raw: dict[str, Any], objects: list[dict[str, Any]], candidates: list[str],
     ) -> tuple[str, str, list[str]] | None:
         source = self._ground_subgoal_query(raw.get("source"), objects, candidates)
-        relation = str(raw.get("relation", "")).strip().casefold()
-        references_raw = raw.get("references")
+        relation = self._normalise_subgoal_relation(raw.get("relation"))
+        # Some otherwise valid JSON-producing models use a singular
+        # ``reference``/``target`` key for one-object relations. Normalise it
+        # here rather than rejecting an unambiguous, safe task.
+        references_raw = raw.get("references", raw.get("reference", raw.get("target")))
+        if isinstance(references_raw, str):
+            references_raw = [references_raw]
         if not isinstance(references_raw, list):
             return None
         references = [self._ground_subgoal_query(item, objects, candidates) for item in references_raw]
@@ -398,6 +419,39 @@ class ExistingAgentBridge:
         if source in references or len(set(references)) != len(references):
             return None
         return source, relation, references
+
+    @staticmethod
+    def _normalise_subgoal_action(value: Any) -> str:
+        action = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "pick_and_place": "pick_place",
+            "pickplace": "pick_place",
+            "place": "pick_place",
+            "stack": "pick_place",
+            "localise": "localize",
+            "detect": "localize",
+            "describe": "describe_scene",
+            "scan_scene": "describe_scene",
+        }
+        return aliases.get(action, action)
+
+    @staticmethod
+    def _normalise_subgoal_relation(value: Any) -> str:
+        relation = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        aliases = {
+            "on_top": "on_top_of",
+            "above": "on_top_of",
+            "atop": "on_top_of",
+            "stacked_on": "on_top_of",
+            "stack_on": "on_top_of",
+            "right": "right_of",
+            "to_the_right_of": "right_of",
+            "left": "left_of",
+            "to_the_left_of": "left_of",
+            "middle": "between",
+            "midway": "between",
+        }
+        return aliases.get(relation, relation)
 
     def _subgoal_queries(
         self, raw: Any, objects: list[dict[str, Any]], candidates: list[str],
@@ -420,8 +474,59 @@ class ExistingAgentBridge:
         trusted_id = self._resolve_trusted_object_id(query, objects)
         if trusted_id:
             return self._trusted_label(trusted_id, objects) or query
-        candidate = next((item for item in candidates if item.casefold() == query.casefold()), None)
-        return candidate or query
+        candidate = self._match_scene_candidate_query(query, candidates)
+        if candidate is not None:
+            return candidate
+        # Once a scene scan has produced candidates, they are the allow-list
+        # for semantic references in a manipulation plan.  Without this
+        # check an LLM can silently turn an intended "white cube" reference
+        # into an unrelated context word such as "table", and SAM3 will
+        # waste a query before the placement computation fails.
+        #
+        # Before any scene scan we retain the existing open-vocabulary
+        # localization behavior: the user can still ask for a new object by
+        # name and have SAM3 attempt to find it.
+        return None if candidates else query
+
+    @staticmethod
+    def _match_scene_candidate_query(query: str, candidates: list[str]) -> str | None:
+        """Resolve a concise user/LLM reference to exactly one scene candidate.
+
+        A VLM may describe an object as ``white cube with number 5`` while a
+        person naturally says ``white cube``.  Exact matching would reject
+        that useful reference; substring matching would be unsafe for two
+        similar cubes.  Token-subset matching preserves the short form only
+        when it identifies a single candidate.
+        """
+        normalized = " ".join(query.casefold().split())
+        exact = [item for item in candidates if " ".join(item.casefold().split()) == normalized]
+        if len(exact) == 1:
+            return exact[0]
+
+        def tokens(value: str) -> set[str]:
+            ignored = {"a", "an", "the", "object", "with", "number", "no"}
+            # These are object-class synonyms, not target aliases. They make
+            # a candidate such as "white block with number 5" match a human
+            # request for "white cube", while colour/number qualifiers still
+            # disambiguate multiple blocks in the same scene.
+            synonyms = {
+                "cube": "block",
+                "cuboid": "block",
+                "box": "block",
+                "marker": "pen",
+                "feltpen": "pen",
+            }
+            return {
+                synonyms.get(item, item)
+                for item in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", value.casefold())
+                if item not in ignored
+            }
+
+        requested = tokens(query)
+        if not requested:
+            return None
+        matches = [item for item in candidates if requested <= tokens(item)]
+        return matches[0] if len(matches) == 1 else None
 
     def _request_structured_task_plan(
         self, instruction: str, objects: list[dict[str, Any]], candidates: list[str],
@@ -434,11 +539,16 @@ class ExistingAgentBridge:
             "\"subgoals\":[{\"action\":\"describe_scene|localize|relative_place|pick_place\","
             "\"queries\":[\"string\"],\"source\":\"string\","
             "\"relation\":\"between|right_of|left_of|on_top_of\",\"references\":[\"string\"]}]}. "
-            "Plan at most four ordered subgoals. Use pick_place only for moving one object, and always specify "
+            "Plan at most four ordered subgoals. Each distinct manipulation instruction (including clauses joined by "
+            "'and') must become its own pick_place subgoal, in the same order as the user stated it. The words "
+            "pick, place, put, stack, set, and move an object all mean a physical manipulation and therefore require "
+            "pick_place, not relative_place. Use pick_place only for moving one object, and always specify "
             "one source plus two references for between or one reference for the other relations. "
             "Use relative_place only for calculating a pose without manipulating. Use localize only for read-only localization. "
             "Do not output coordinates, trajectories, grasps, ROS commands, gripper commands, or unsupported actions. "
-            "Use exact trusted labels/IDs or candidate queries when possible. If unclear, set needs_clarification=true. "
+            "Resolve ordinary synonyms against the listed candidates (for example cube/block or marker/pen). "
+            "For every source, reference, and query, output the exact matching candidate query verbatim whenever a "
+            "candidate exists; do not copy a less-specific user synonym. If unclear, set needs_clarification=true. "
             f"Trusted verified objects (no coordinates): {json.dumps(objects, ensure_ascii=False)}. "
             f"Unverified scene candidates: {json.dumps(candidates, ensure_ascii=False)}."
         )
@@ -527,7 +637,11 @@ class ExistingAgentBridge:
                 "A between placement needs two reference objects; other relative placements need one reference object."
             )
 
-        pick_required = bool(intent.get("pick_required", False))
+        # In normal operator language "place/put/stack the object" is a
+        # physical request, even when the word "pick" is omitted.  The old
+        # parser treated it as plan-only and stopped after Compute Place Pose.
+        # Only explicit planning/preview language keeps the request read-only.
+        pick_required = bool(intent.get("pick_required", False)) or self._requests_physical_manipulation(instruction)
         if kind == "relative_place":
             source_id = self._resolve_trusted_object_id(source, objects)
             reference_ids = [self._resolve_trusted_object_id(item, objects) for item in references]
@@ -688,7 +802,8 @@ class ExistingAgentBridge:
             '"pick_required":false,"confidence":0.0,"needs_clarification":false}. '
             "Interpret natural language flexibly: stack/atop/above means on_top_of; "
             "to the right/left means right_of/left_of; midway/in the middle means between. "
-            "Set pick_required=true only when the user asks to pick/grasp/lift the source object. "
+            "Set pick_required=true for any physical request to pick, grasp, lift, place, put, stack, set, or move "
+            "an object. Set it false only for an explicitly plan-only/compute/preview request. "
             "For relative_place, source and references MUST be exact object_id values from the trusted catalog, "
             "and every object must be present. For localize_then_relative_place use concise object descriptions "
             "as queries; when an unverified scene candidate matches, copy that candidate query exactly. "
@@ -705,6 +820,27 @@ class ExistingAgentBridge:
             raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE)
         parsed = json.loads(raw)
         return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _requests_physical_manipulation(instruction: str) -> bool:
+        """Conservative lexical backstop for a physical place request.
+
+        The LLM remains responsible for relation and object grounding.  This
+        guard only prevents it from silently downgrading an operator's plain
+        "place X ..." instruction into a geometry-only computation.
+        """
+        text = " ".join(instruction.casefold().split())
+        plan_only_markers = (
+            "plan-only", "plan only", "compute", "calculate", "preview", "do not execute",
+            "只计算", "仅计算", "只规划", "仅规划", "预览", "不要执行",
+        )
+        if any(marker in text for marker in plan_only_markers):
+            return False
+        physical_markers = (
+            "pick", "grasp", "lift", "place", "put", "stack", "set", "move",
+            "抓取", "拿起", "放置", "放到", "放在", "堆叠", "移动",
+        )
+        return any(marker in text for marker in physical_markers)
 
     @staticmethod
     def is_capability_question(instruction: str) -> bool:
