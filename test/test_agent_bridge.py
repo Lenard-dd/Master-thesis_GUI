@@ -183,6 +183,65 @@ def test_structured_multi_subgoal_plan_compiles_two_serial_pick_place_workflows(
     assert response.tool_events[7].input_json == {"object_query": "white cube"}
 
 
+def test_move_to_observe_then_describe_scene_is_a_valid_composed_plan():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            "subgoals": [
+                {"action": "move_to_observe"},
+                {"action": "describe_scene"},
+            ],
+        },
+    )
+
+    response = bridge.submit("move to observe position and describe the scene again")
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "describe_scene",
+    ]
+    assert response.tool_events[0].input_json == {
+        "target_name": "observe", "purpose": "agent_observe",
+    }
+    assert response.tool_events[0].requires_approval is True
+    assert response.tool_events[1].dependencies == [response.tool_events[0].node_id]
+
+
+def test_observe_and_scene_description_repairs_a_localize_without_queries():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            # Representative LLM slip: it selected localization for a
+            # description request but supplied no object query.
+            "subgoals": [{"action": "localize"}],
+        },
+    )
+
+    response = bridge.submit("move to observe position and describe the scene again")
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "describe_scene",
+    ]
+    assert response.tool_events[1].dependencies == [response.tool_events[0].node_id]
+
+
+def test_move_to_observe_and_describe_without_the_word_position_uses_composed_plan():
+    bridge = ExistingAgentBridge(
+        "existing_openai",
+        structured_task_parser=lambda _instruction, _objects, _candidates: {
+            "kind": "task_plan", "confidence": 0.95, "needs_clarification": False,
+            "subgoals": [{"action": "move_to_observe"}, {"action": "describe_scene"}],
+        },
+    )
+
+    response = bridge.submit("move to observe and describe the scene")
+
+    assert [event.tool_name for event in response.tool_events] == [
+        "move_to_named_target", "describe_scene",
+    ]
+
+
 def test_structured_plan_rejects_an_ungrounded_bulk_object_placeholder():
     bridge = ExistingAgentBridge(
         "existing_openai",

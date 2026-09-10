@@ -273,10 +273,49 @@ class ExistingAgentBridge:
         events: list[AgentToolEvent] = []
         predecessor: str | None = None
         sequence = 1
+        # Repair two harmless but common LLM schema slips using explicit user
+        # wording.  The repair can create only the calibrated ``observe``
+        # motion (which remains HITL-gated) and the read-only scene describer;
+        # it never invents a free-form robot target or an object query.
+        planned_actions = [
+            self._normalise_subgoal_action(item.get("action"))
+            for item in raw_subgoals if isinstance(item, dict)
+        ]
+        if self._requests_observe_motion(instruction) and "move_to_observe" not in planned_actions:
+            node_id = "agent-0-move_to_observe"
+            events.append(AgentToolEvent(
+                node_id=node_id, parent_id=None,
+                tool_name="move_to_named_target", display_name="Move To Observe",
+                status="waiting_approval",
+                input_json={"target_name": "observe", "purpose": "agent_observe"},
+                output_json={"approval_stages": ["task_intent"]},
+                requires_approval=True, approval_stages=["task_intent"],
+                description="Move to the explicitly requested calibrated observation pose.",
+                node_type="tool", phase="motion_planning", sequence_index=sequence,
+            ))
+            predecessor, sequence = node_id, sequence + 1
         for index, raw in enumerate(raw_subgoals, start=1):
             if not isinstance(raw, dict):
                 return AgentResponse("One of the proposed subgoals is not structured correctly.")
             action = self._normalise_subgoal_action(raw.get("action"))
+            if action == "move_to_observe":
+                # General composition may use only the calibrated observation
+                # posture; arbitrary robot targets remain outside the LLM's
+                # authority and still require the existing reviewed routes.
+                node_id = f"agent-{index}-move_to_observe"
+                events.append(AgentToolEvent(
+                    node_id=node_id, parent_id=predecessor,
+                    tool_name="move_to_named_target", display_name=f"Move To Observe ({index})",
+                    status="waiting_approval",
+                    input_json={"target_name": "observe", "purpose": "agent_observe"},
+                    output_json={"approval_stages": ["task_intent"]},
+                    requires_approval=True, approval_stages=["task_intent"],
+                    description="Move to the calibrated observation pose before the next subgoal.",
+                    node_type="tool", phase="motion_planning", sequence_index=sequence,
+                    dependencies=[predecessor] if predecessor else [],
+                ))
+                predecessor, sequence = node_id, sequence + 1
+                continue
             if action == "describe_scene":
                 node_id = f"agent-{index}-describe_scene"
                 events.append(AgentToolEvent(
@@ -290,6 +329,22 @@ class ExistingAgentBridge:
                 continue
             if action == "localize":
                 queries = self._subgoal_queries(raw.get("queries"), objects, candidates)
+                if not queries:
+                    if self._requests_scene_description(instruction):
+                        action = "describe_scene"
+                    else:
+                        return AgentResponse("Each localization subgoal needs one or more specific object descriptions.")
+                if action == "describe_scene":
+                    node_id = f"agent-{index}-describe_scene"
+                    events.append(AgentToolEvent(
+                        node_id=node_id, parent_id=predecessor, tool_name="describe_scene",
+                        display_name=f"Describe Scene ({index})", status="pending",
+                        description="Read-only semantic scene description.", node_type="tool",
+                        phase="perception", sequence_index=sequence,
+                        dependencies=[predecessor] if predecessor else [],
+                    ))
+                    predecessor, sequence = node_id, sequence + 1
+                    continue
                 if not queries:
                     return AgentResponse("Each localization subgoal needs one or more specific object descriptions.")
                 node_id = f"agent-{index}-detect_objects"
@@ -391,10 +446,29 @@ class ExistingAgentBridge:
         # and should therefore enter the structured planner rather than the
         # legacy single-relation parser.
         english_actions = re.findall(
-            r"\b(?:pick(?:\s+up)?|place|put|move|stack|set|position)\b", text,
+            r"\b(?:pick(?:\s+up)?|place|put|move|stack|set|position|describe|scan|analy[sz]e|locali[sz]e)\b",
+            text,
         )
-        chinese_actions = re.findall(r"(?:抓取|拿起|放置|放到|放在|移动|堆叠)", text)
+        chinese_actions = re.findall(r"(?:抓取|拿起|放置|放到|放在|移动|堆叠|描述|扫描|分析|定位|识别)", text)
         return len(english_actions) >= 2 or len(chinese_actions) >= 2
+
+    @staticmethod
+    def _requests_observe_motion(instruction: str) -> bool:
+        text = " ".join(instruction.casefold().split())
+        asks_motion = any(term in text for term in ("move", "go to", "return to", "移动", "前往", "回到"))
+        asks_observe = any(term in text for term in (
+            "observe", "observation pose", "observation position", "view position",
+            "观察位", "观察位置", "观测位",
+        ))
+        return asks_motion and asks_observe
+
+    @staticmethod
+    def _requests_scene_description(instruction: str) -> bool:
+        text = " ".join(instruction.casefold().split())
+        return any(term in text for term in (
+            "describe the scene", "describe scene", "scan the scene", "scan scene", "analyze the scene",
+            "analyse the scene", "描述场景", "扫描场景", "分析场景",
+        ))
 
     def _subgoal_relation(
         self, raw: dict[str, Any], objects: list[dict[str, Any]], candidates: list[str],
@@ -428,6 +502,11 @@ class ExistingAgentBridge:
             "pickplace": "pick_place",
             "place": "pick_place",
             "stack": "pick_place",
+            "move_to_observation": "move_to_observe",
+            "move_to_view": "move_to_observe",
+            "observe": "move_to_observe",
+            "move": "move_to_observe",
+            "view_scene": "move_to_observe",
             "localise": "localize",
             "detect": "localize",
             "describe": "describe_scene",
@@ -536,7 +615,7 @@ class ExistingAgentBridge:
         prompt = (
             "You are a constrained robot task planner. Return exactly one JSON object, no Markdown. "
             "Schema: {\"kind\":\"task_plan|unknown\",\"summary\":\"string\",\"confidence\":0.0,\"needs_clarification\":false,"
-            "\"subgoals\":[{\"action\":\"describe_scene|localize|relative_place|pick_place\","
+            "\"subgoals\":[{\"action\":\"move_to_observe|describe_scene|localize|relative_place|pick_place\","
             "\"queries\":[\"string\"],\"source\":\"string\","
             "\"relation\":\"between|right_of|left_of|on_top_of\",\"references\":[\"string\"]}]}. "
             "Plan at most four ordered subgoals. Each distinct manipulation instruction (including clauses joined by "
@@ -544,7 +623,10 @@ class ExistingAgentBridge:
             "pick, place, put, stack, set, and move an object all mean a physical manipulation and therefore require "
             "pick_place, not relative_place. Use pick_place only for moving one object, and always specify "
             "one source plus two references for between or one reference for the other relations. "
-            "Use relative_place only for calculating a pose without manipulating. Use localize only for read-only localization. "
+            "Use move_to_observe only for a request to move to the observation/view pose; it has no object fields. "
+            "Use describe_scene for a semantic scene scan/description and it has no object fields. "
+            "Use relative_place only for calculating a pose without manipulating. Use localize only for read-only localization "
+            "of named objects, and never use localize as a substitute for describe_scene. "
             "Do not output coordinates, trajectories, grasps, ROS commands, gripper commands, or unsupported actions. "
             "Resolve ordinary synonyms against the listed candidates (for example cube/block or marker/pen). "
             "For every source, reference, and query, output the exact matching candidate query verbatim whenever a "
