@@ -317,15 +317,35 @@ class GuiSkillRuntimeAdapter:
                 self.controller.start_ready_agent_tool_dependents()
             elif node.input_data.get("purpose") == "post_place_observe":
                 parent = self._parent(task_id)
-                if parent:
-                    parent.status = ToolStatus.SUCCEEDED
-                    self.controller.register_tool_node(parent, append_legacy=False)
+                if parent is None:
+                    # A post-place return is created by a composite
+                    # pick/place node.  Treat a missing owner as a runtime
+                    # consistency failure, never as successful task
+                    # completion: otherwise a later subgoal could silently
+                    # be skipped.
+                    self.controller.fail_task(
+                        "Post-place observation lost its owning pick/place subgoal.",
+                        node_id=node.node_id,
+                    )
+                    return
+                parent.status = ToolStatus.SUCCEEDED
+                self.controller.register_tool_node(parent, append_legacy=False)
                 # A structured plan can contain another pick/place subgoal
                 # after this composite parent.  Its dependency becomes ready
                 # only once the whole preceding subgoal has returned to the
                 # observation pose.
                 self.controller.start_ready_agent_tool_dependents()
-                if not self._has_pending_agent_successor(task_id, parent.node_id if parent else None):
+                # Do not use only the direct successor as the terminal test.
+                # A structured multi-subgoal plan can contain later pending
+                # nodes which are not a direct child after a plan repair or a
+                # dynamically inserted review.  Completing here would make
+                # the GUI look as though the first pick/place were the final
+                # task.  Every precompiled Agent node must be successful
+                # before the overall task may complete.
+                if (
+                    not self._has_pending_agent_successor(task_id, parent.node_id)
+                    and not self._has_incomplete_structured_agent_work()
+                ):
                     self.controller.complete_task()
             else:
                 loop.create_task(self._run_sensor_stages(task_id))
@@ -864,7 +884,9 @@ class GuiSkillRuntimeAdapter:
         """Finish a physical pick/place only after returning to observe."""
         parent = self._parent(task_id)
         if parent is None:
-            self.controller.complete_task()
+            self.controller.fail_task(
+                "Cannot schedule the post-place observation motion without an owning pick/place subgoal."
+            )
             return
         self._request_named_motion(
             parent, "observe", "Return To Observe After Place",
@@ -881,6 +903,20 @@ class GuiSkillRuntimeAdapter:
             if node.status in {ToolStatus.PENDING, ToolStatus.WAITING_APPROVAL, ToolStatus.RUNNING}:
                 return True
         return False
+
+    def _has_incomplete_structured_agent_work(self) -> bool:
+        """Return whether a compiled Agent DAG still has unfinished work.
+
+        Dynamic skill-runtime children also inherit an ``agent-...`` id from
+        their composite parent, so this covers both the visible plan nodes and
+        the grasp/place stages that they create.  A task is terminal only when
+        every one of these nodes has succeeded; failed, rejected, cancelled,
+        or invalidated nodes are deliberately *not* treated as completion.
+        """
+        return any(
+            node.node_id.startswith("agent-") and node.status != ToolStatus.SUCCEEDED
+            for node in self.controller.state.tool_nodes
+        )
 
     async def _run_non_motion(self, task_id, parent, skill_id, display_name, parameters, context):
         if task_id in self._cancelled_task_ids:

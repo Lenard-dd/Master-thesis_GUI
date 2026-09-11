@@ -1,0 +1,26 @@
+{
+  "configurations": [
+    {
+      "browse": {
+        "databaseFilename": "${workspaceFolder}/.vscode/browse.vc.db",
+        "limitSymbolsToIncludedHeaders": false
+      },
+      "includePath": [
+        "/home/lenard/dev_ws/install/robotiq_2f_gripper_hardware/include/**",
+        "/home/lenard/dev_ws/install/robotiq_2f_gripper_interfaces/include/**",
+        "/home/lenard/dev_ws/install/serial/include/**",
+        "/home/lenard/dev_ws/install/robotiq_gripper_communication/include/**",
+        "/home/lenard/dev_ws/install/robotiq_2f_gripper_msgs/include/**",
+        "/home/lenard/dev_ws/install/learning_interface/include/**",
+        "/opt/ros/humble/include/**",
+        "/usr/include/**"
+      ],
+      "name": "ros2",
+      "intelliSenseMode": "gcc-x64",
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "gnu11",
+      "cppStandard": "c++17"
+    }
+  ],
+  "version": 4
+}

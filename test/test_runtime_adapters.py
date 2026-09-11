@@ -188,6 +188,47 @@ def test_post_place_observe_releases_a_dependent_next_subgoal_instead_of_complet
     asyncio.run(scenario())
 
 
+def test_post_place_observe_never_completes_while_later_agent_subgoal_is_pending():
+    """A later compiled subgoal must survive the first pick/place completion.
+
+    This specifically protects against a malformed/repaired dependency edge:
+    the terminal guard must inspect the full structured Agent plan, not only
+    direct successors of the first composite node.
+    """
+    async def scenario():
+        controller = GuiController()
+        controller.state.current_task_id = "task-sequence"
+        runtime = controller.skill_runtime
+        parent = ToolNode(
+            node_id="agent-1-supervised_pick_from_localization", parent_id=None,
+            tool_name="supervised_pick_from_localization",
+            display_name="Pick and Place 1", status=ToolStatus.RUNNING,
+        )
+        post = ToolNode(
+            node_id="agent-1-supervised_pick_from_localization:post-place:4",
+            parent_id=parent.node_id, tool_name="move_to_named_target",
+            display_name="Return To Observe After Place", status=ToolStatus.SUCCEEDED,
+            input_data={"purpose": "post_place_observe"},
+        )
+        # This later plan node intentionally has no direct edge from ``parent``.
+        # It models the edge case that previously allowed premature completion.
+        later = ToolNode(
+            node_id="agent-2-move_to_observe", parent_id=None,
+            tool_name="move_to_named_target", display_name="Move To Observe (2)",
+            status=ToolStatus.PENDING, requires_approval=True,
+        )
+        controller.state.tool_nodes.extend([parent, post, later])
+        runtime._parents["task-sequence"] = parent.node_id
+        controller.start_ready_agent_tool_dependents = lambda: None
+
+        runtime.on_motion_execution_completed(post.node_id)
+
+        assert parent.status == ToolStatus.SUCCEEDED
+        assert controller.state.task_status.value != "COMPLETED"
+
+    asyncio.run(scenario())
+
+
 def test_safe_pick_completes_the_full_mock_tree_through_each_hitl_gate():
     async def scenario():
         controller = GuiController()
